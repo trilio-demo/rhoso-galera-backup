@@ -4,7 +4,7 @@
 
 **Environment:** RHOSO 18 / OpenShift
 **Cluster:** 3-node Galera (openstack-galera-0, -1, -2)
-**Backup Tool:** TrilioVault for Kubernetes
+**Backup Tool:** Trilio for Kubernetes
 **Backup Node:** openstack-galera-0 (designated)
 **Namespace:** openstack
 
@@ -12,20 +12,20 @@
 
 ## Pre-Deployment Checklist
 
-### 1. Verify TrilioVault Installation
+### 1. Verify Trilio for Kubernetes Installation
 
 ```bash
-# Check TrilioVault operator is running
+# Check Trilio for Kubernetes operator is running
 oc get pods -n trilio-system
 
-# Verify TrilioVault CRDs are installed
+# Verify Trilio for Kubernetes CRDs are installed
 oc get crd | grep triliovault
 
-# Check TrilioVault version
+# Check Trilio for Kubernetes version
 oc get deployment k8s-triliovault-control-plane -n trilio-system -o jsonpath='{.spec.template.spec.containers[0].image}'
 ```
 
-### 2. Create TrilioVault Target
+### 2. Create Trilio for Kubernetes Target
 
 ```bash
 # Example: S3-compatible target
@@ -289,7 +289,7 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
   -e "SHOW VARIABLES LIKE \"wsrep_desync\"; \
       SHOW STATUS LIKE \"wsrep_local_state_comment\";"'
 
-# Check TrilioVault operator logs
+# Check Trilio for Kubernetes operator logs
 oc logs -n trilio-system -l app=k8s-triliovault --tail=100
 ```
 
@@ -727,8 +727,8 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
 
 ## Contact & Escalation
 
-**For TrilioVault issues:**
-- TrilioVault Documentation: https://docs.trilio.io
+**For Trilio for Kubernetes issues:**
+- Trilio for Kubernetes Documentation: https://docs.trilio.io
 - Support: support@trilio.io
 - KB: https://support.trilio.io
 

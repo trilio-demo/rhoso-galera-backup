@@ -13,7 +13,7 @@ This checklist ensures that the Galera backup solution is fully tested and valid
 - [ ] OpenShift cluster accessible
 - [ ] RHOSO 18 deployed
 - [ ] Galera cluster running with 3 nodes
-- [ ] TrilioVault for Kubernetes installed
+- [ ] Trilio for Kubernetes installed
 - [ ] `oc` CLI configured and authenticated
 - [ ] Appropriate RBAC permissions
 
@@ -206,9 +206,9 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
 
 ---
 
-### ✅ Test 4: TrilioVault Target Validation
+### ✅ Test 4: Trilio for Kubernetes Target Validation
 
-**Objective:** Verify TrilioVault can connect to backup storage
+**Objective:** Verify Trilio for Kubernetes can connect to backup storage
 
 **Steps:**
 
@@ -225,7 +225,7 @@ oc get target <your-target-name> -n openstack -o jsonpath='{.status.status}'
 # 4. Verify credentials
 oc get secret <credentials-secret-name> -n openstack
 
-# 5. Test target connectivity (if supported by TrilioVault version)
+# 5. Test target connectivity (if supported by Trilio for Kubernetes version)
 # Some versions have a validation endpoint
 oc describe target <your-target-name> -n openstack | grep -i "validation\|status\|available"
 ```
@@ -923,7 +923,7 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
 
 - OpenShift Version: _______________
 - RHOSO Version: _______________
-- TrilioVault Version: _______________
+- Trilio for Kubernetes Version: _______________
 - Galera Cluster Size: _______________
 - Database Size: _______________
 - Test Date: _______________

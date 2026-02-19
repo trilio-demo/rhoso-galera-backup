@@ -233,7 +233,7 @@ oc get restore -n openstack -w
 
 ### Retention
 - **Policy:** Intentionally, there is no retention set
-- **Rotation:** Automatic via TrilioVault
+- **Rotation:** Automatic via Trilio for Kubernetes
 
 ### Resources Backed Up
 - ✅ openstack-galera-0 PVC (50GB)
@@ -267,7 +267,7 @@ oc get restore -n openstack -w
 
 ### Contacts
 
-**TrilioVault Support:**
+**Trilio for Kubernetes Support:**
 - Email: support@trilio.io
 - Portal: https://trilio.my.site.com/io/s/
 - Docs: https://docs.trilio.io
@@ -311,7 +311,7 @@ Backup failed?
 │  └─ Check connection count, network, or schedule during lower traffic
 │
 └─ Other error?
-   └─ Check TrilioVault logs: oc logs -n trilio-system -l app=k8s-triliovault
+   └─ Check Trilio for Kubernetes logs: oc logs -n trilio-system -l app=k8s-triliovault
 ```
 
 ---

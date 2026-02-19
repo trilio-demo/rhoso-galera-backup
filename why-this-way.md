@@ -25,7 +25,7 @@ minutes they are fully populated and the cluster is back to 3/3 Synced.
 
 ## Why use a Hook at all?
 
-TrilioVault snapshots a PVC at the storage layer. Without intervention, MySQL
+Trilio for Kubernetes snapshots a PVC at the storage layer. Without intervention, MySQL
 could have dirty pages in memory that have not yet been flushed to disk at the
 moment the snapshot is taken. The result would be a backup that is not crash-
 consistent — it would require InnoDB crash recovery on restore and could
@@ -83,7 +83,7 @@ traffic throughout the backup window.
 
 The "backup window" — the period during which galera-0 is locked and
 unavailable — is the time between `FLUSH TABLES WITH READ LOCK` and
-`UNLOCK TABLES`. TrilioVault's CSI snapshot mechanism operates at the storage
+`UNLOCK TABLES`. Trilio for Kubernetes's CSI snapshot mechanism operates at the storage
 layer and completes in seconds regardless of data size (it is a pointer
 operation, not a copy). The actual data transfer to the Backup Target happens
 after the snapshot is taken and the lock is released.
@@ -127,10 +127,10 @@ in the `openstackcontrolplane` CR. The operator then applies the change itself.
 
 When performing a full disaster restore to the same namespace (`openstack`), the
 StatefulSet and other Kubernetes resources still exist — they are just scaled to
-0 replicas. TrilioVault would normally try to recreate them, fail with a conflict
+0 replicas. Trilio for Kubernetes would normally try to recreate them, fail with a conflict
 error, and abort the restore.
 
-`skipIfAlreadyExists: true` (under `restoreFlags`) tells TVK to skip any resource
+`skipIfAlreadyExists: true` (under `restoreFlags`) tells T4K to skip any resource
 that already exists and focus only on what is missing — in this case, the deleted
 PVCs. The StatefulSet is left untouched and the PVCs are recreated from backup.
 
@@ -148,7 +148,7 @@ When restoring a PVC from the `openstack` namespace into a different namespace
 starts, tries to read `/var/lib/mysql`, and gets a permission denied error
 because it is running under a UID that does not own the files.
 
-`useOCPNamespaceUIDRange: true` instructs TVK to remap file ownership on the
+`useOCPNamespaceUIDRange: true` instructs T4K to remap file ownership on the
 restored PVC to match the target namespace's UID range. Without this flag, cross-
 namespace restores in OpenShift will always fail at the MySQL startup stage.
 
@@ -171,7 +171,7 @@ bootstrap sequence without manual intervention. This was confirmed in live testi
 
 ## Why does the Backup Target type (NFS vs S3) not affect the procedures?
 
-TrilioVault abstracts the backup storage behind a `Target` CR. The backup,
+Trilio for Kubernetes abstracts the backup storage behind a `Target` CR. The backup,
 restore, and hook procedures are identical regardless of whether the target is
 NFS or S3-compatible object storage. The only difference is the Target CR
 definition itself (credentials, endpoint, bucket/share name).

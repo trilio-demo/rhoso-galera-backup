@@ -1,10 +1,10 @@
 # Galera Backup Solution for RHOSO 18
 
-Complete TrilioVault-based backup and disaster recovery solution for a 3-node
+Complete Trilio for Kubernetes-based backup and disaster recovery solution for a 3-node
 MariaDB Galera cluster in a Red Hat OpenStack Services on OpenShift 18 environment.
 
 **Validated:** All files tested against a live RHOSO 18 cluster (February 2026)
-**TVK Version:** 5.2.0
+**T4K Version:** 5.2.0
 **Target types supported:** NFS, S3-compatible object storage
 
 ---
@@ -13,8 +13,8 @@ MariaDB Galera cluster in a Red Hat OpenStack Services on OpenShift 18 environme
 
 | File | Purpose | Use |
 |------|---------|-----|
-| `galera-backup-hook.yaml` | TrilioVault Hook CR | Deploy to enable consistent backups |
-| `galera-backup-plan.yaml` | TrilioVault BackupPlan CR | Deploy to configure backup schedule and targets |
+| `galera-backup-hook.yaml` | Trilio for Kubernetes Hook CR | Deploy to enable consistent backups |
+| `galera-backup-plan.yaml` | Trilio for Kubernetes BackupPlan CR | Deploy to configure backup schedule and targets |
 | `galera-health-check.sh` | Read-only cluster health check | Run anytime to verify cluster + OpenStack health |
 | `galera-real-disaster-tests.md` | Disaster recovery test guide | Full procedures, observed results, production caveats |
 | `galera-backup-runbook.md` | Operational runbook | Day-to-day operations reference |
@@ -28,7 +28,7 @@ MariaDB Galera cluster in a Red Hat OpenStack Services on OpenShift 18 environme
 ### Prerequisites
 
 ```bash
-# TrilioVault must be installed and a Target CR must exist
+# Trilio for Kubernetes must be installed and a Target CR must exist
 oc get pods -n trilio-system
 oc get target -n openstack
 
@@ -124,7 +124,7 @@ The Hook runs on `openstack-galera-0` and ensures data consistency:
 2. Desynchronises galera-0 from the cluster (it stops receiving writes)
 3. Verifies desync took effect
 4. Locks all tables with `FLUSH TABLES WITH READ LOCK`
-5. TrilioVault takes the PVC snapshot
+5. Trilio for Kubernetes takes the PVC snapshot
 
 **Post-backup:**
 1. Releases the table lock
@@ -224,7 +224,7 @@ the validation error.
 
 **Why `skipIfAlreadyExists: true` on the Restore CR?**
 When restoring to the same namespace, the StatefulSet still exists (at 0
-replicas). This flag tells TVK to skip it and focus only on recreating the
+replicas). This flag tells T4K to skip it and focus only on recreating the
 deleted PVCs.
 
 **Why `useOCPNamespaceUIDRange: true` for cross-namespace restores?**
@@ -236,7 +236,7 @@ causing MySQL to fail to read its data directory.
 
 ## Support Resources
 
-- **TrilioVault docs:** https://docs.trilio.io
+- **Trilio for Kubernetes docs:** https://docs.trilio.io
 - **RHOSO 18 docs:** https://docs.redhat.com/en/documentation/red_hat_openstack_services_on_openshift/18.0
 - **Galera docs:** https://galeracluster.com/library/documentation/
 
@@ -247,5 +247,5 @@ causing MySQL to fail to read its data directory.
 **Version:** 2.0
 **Created:** February 17, 2026
 **Updated:** February 18, 2026
-**Environment:** RHOSO 18 / OpenShift / TrilioVault 5.2.0
+**Environment:** RHOSO 18 / OpenShift / Trilio for Kubernetes 5.2.0
 **Status:** Production-ready — validated against live cluster

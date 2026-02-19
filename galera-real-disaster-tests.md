@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document covers disaster scenarios for the Galera cluster backed up by TrilioVault.
+This document covers disaster scenarios for the Galera cluster backed up by Trilio for Kubernetes.
 
 **What the backup includes (from `galera-backup-plan.yaml`):**
 - StatefulSet: `openstack-galera`
@@ -27,13 +27,13 @@ This document covers disaster scenarios for the Galera cluster backed up by Tril
 - **placement** - Resource providers and allocations
 - **barbican** - Key manager (secrets, certificates)
 - **dmapi** - Data mover API
-- **workloadmgr** - TrilioVault for OpenStack (cloud-level backup metadata, NOT the TVK4K product doing this backup)
+- **workloadmgr** - Trilio for OpenStack (cloud-level backup metadata, NOT the T4K product doing this backup)
 
 **Backup used for testing:** `secondtrygalera` (Full, Available, 584MB)
 **Target:** `sa-lab-nfs-share1` (NFS) — see note below
 
 > **Target type note:** These tests were performed using an NFS Backup Target.
-> TrilioVault also supports S3-compatible object storage targets. The backup,
+> Trilio for Kubernetes also supports S3-compatible object storage targets. The backup,
 > restore, and verification procedures are identical regardless of target type.
 > Where this document refers to "Backup Target (NFS/S3)", the steps apply to both.
 > The restore and verification procedures behave identically on both target types.
@@ -214,7 +214,7 @@ oc exec openstack-galera-1 -n openstack -c galera -- bash -c \
 
 ## Backup Restore Tests (Backup Required)
 
-These are the scenarios where Galera cannot self-heal and your TrilioVault
+These are the scenarios where Galera cannot self-heal and your Trilio for Kubernetes
 backup is the only recovery path.
 
 ### Test 3: Restore to Test Namespace (Non-Destructive Validation)
@@ -384,7 +384,7 @@ the probe never succeeds. The pods keep restarting — this is completely expect
 and does not indicate a problem with the backup data.
 
 **Resources actually restored (observed from UI):**
-TrilioVault restores more than just the 7 resources listed in the BackupPlan —
+Trilio for Kubernetes restores more than just the 7 resources listed in the BackupPlan —
 it also captures cluster-managed resources associated with the workload:
 - ServiceAccount: `galera-openstack`
 - Secrets: `osp-secret`, `combined-ca-bundle`, `cert-galera-openstack-svc`
@@ -446,10 +446,10 @@ by the StatefulSet's `volumeClaimTemplates`.
 **useOCPNamespaceUIDRange:** Without this flag, the pod would fail to read its
 own datadir because files on the PVC are owned by the source namespace UID
 (e.g. `1000700000`) while the target namespace assigns a different UID range
-(e.g. `1000840000`). TrilioVault remaps ownership on restore when this flag is set.
+(e.g. `1000840000`). Trilio for Kubernetes remaps ownership on restore when this flag is set.
 
 **Using the UI instead of CLI:**
-When creating the restore in the TrilioVault UI, ensure you enable:
+When creating the restore in the Trilio for Kubernetes UI, ensure you enable:
 - **Skip if already exists** → `skipIfAlreadyExists: true`
 - **Use OCP Namespace UID Range** → `useOCPNamespaceUIDRange: true`
 
@@ -739,7 +739,7 @@ As confirmed in Test 4 (February 18, 2026): the cluster formed with all 3 nodes
 > ```
 
 ### Namespace Deletion and Backup Metadata
-TrilioVault Backup CRs live in the same namespace as the workload. Deleting the
+Trilio for Kubernetes Backup CRs live in the same namespace as the workload. Deleting the
 namespace destroys the backup metadata (not the data). Recovery requires:
 1. Recreating the Target CR
 2. Re-discovering backups from the target storage
@@ -1264,22 +1264,4 @@ For each test, record:
 Document Version: 3.7
 Created: February 17, 2026
 Updated: February 18, 2026
-Changes in 3.6:
-- Scope section: added note that tests used NFS but procedure applies equally to S3 targets
-- Generic "Backup Target (NFS/S3)" terminology used throughout where not target-type-specific
-- Test 6 (Namespace deletion) removed — to be covered in a dedicated session
-- Removed NFS mount delay note from Test 4 (lab-specific behaviour, not expected in production)
-Changes in 3.5:
-- Added "Production Restore Caveats" section covering state divergence per service:
-  Nova (ghost/orphaned VMs, Placement drift), Cinder (orphaned Ceph volumes, double-attach
-  risk, stuck states), Neutron/OVN (port/flow divergence), Keystone (password rollback,
-  token revocation), Barbican (key rotation — potentially unrecoverable data),
-  Placement (allocation chaos), Glance (ghost images), Heat (stack state divergence)
-- Added recommended post-restore audit sequence with concrete commands for each service
-Changes in 3.4:
-- Test 5 (All PVCs Destroyed) collapsed into a short note — procedure identical to Test 4
-Changes in 3.3:
-- Test 4 completed: OSCP operator handles safe_to_bootstrap automatically (no manual sed needed)
-- Test 4 observed results added (all 5 records restored, cluster 3/3 Synced)
-- Added TVK NFS mount delay note (~15 min validation phase is normal)
-- Bootstrap After Restore: updated to reflect automatic handling in RHOSO 18
+
