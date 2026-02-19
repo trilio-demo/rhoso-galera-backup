@@ -177,13 +177,12 @@ oc logs -f openstack-galera-0 -n openstack -c galera | grep trilio-backup
 
 ### Step 4: Enable Automated Schedule (Optional)
 
-```bash
-# If you included the Schedule in galera-backup-plan.yaml, it's already applied
-# Otherwise, uncomment the schedule section and reapply
+> **Note:** No schedule is configured in `galera-backup-plan.yaml` by default. Backups are triggered manually. If you want automated backups, create a Schedule CR separately and reference the `openstack-galera-backup` BackupPlan.
 
-# Verify schedule
-oc get schedule daily-galera-backup -n openstack
-oc describe schedule daily-galera-backup -n openstack
+```bash
+# Verify your schedule was created
+oc get schedule <your-schedule-name> -n openstack
+oc describe schedule <your-schedule-name> -n openstack
 ```
 
 ---
@@ -607,20 +606,22 @@ oc logs openstack-galera-0 -n openstack -c galera --since=24h | grep -E "Desync|
 
 ### Temporarily Disable Backups
 
+> **Note:** No schedule is configured in `galera-backup-plan.yaml` by default. These steps only apply if you have added a Schedule CR manually.
+
 ```bash
 # Suspend the schedule
-oc patch schedule daily-galera-backup -n openstack \
+oc patch schedule <your-schedule-name> -n openstack \
   --type=merge -p '{"spec":{"suspend":true}}'
 
 # Verify
-oc get schedule daily-galera-backup -n openstack -o jsonpath='{.spec.suspend}'
+oc get schedule <your-schedule-name> -n openstack -o jsonpath='{.spec.suspend}'
 ```
 
 ### Re-enable Backups
 
 ```bash
 # Resume the schedule
-oc patch schedule daily-galera-backup -n openstack \
+oc patch schedule <your-schedule-name> -n openstack \
   --type=merge -p '{"spec":{"suspend":false}}'
 ```
 

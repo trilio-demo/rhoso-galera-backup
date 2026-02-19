@@ -85,13 +85,15 @@ oc logs openstack-galera-0 -n openstack -c galera --since-time="2026-02-17T02:00
 
 ### Suspend/Resume Schedule
 
+> No schedule is configured by default. If you have added one, use its name below.
+
 ```bash
 # Suspend (disable automated backups)
-oc patch schedule daily-galera-backup -n openstack \
+oc patch schedule <your-schedule-name> -n openstack \
   --type=merge -p '{"spec":{"suspend":true}}'
 
 # Resume
-oc patch schedule daily-galera-backup -n openstack \
+oc patch schedule <your-schedule-name> -n openstack \
   --type=merge -p '{"spec":{"suspend":false}}'
 ```
 

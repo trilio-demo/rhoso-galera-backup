@@ -794,27 +794,29 @@ diff /tmp/pre-restore-dbs.txt /tmp/post-restore-dbs.txt
 
 ## Phase 6: Production Readiness
 
-### ✅ Test 15: Schedule Configuration
+### ✅ Test 15: Schedule Configuration (Optional)
+
+> **Note:** No schedule is configured in `galera-backup-plan.yaml` by default. Skip this test if you are not using automated scheduling. Only run if you have created a Schedule CR manually.
 
 **Steps:**
 
 ```bash
 # 1. Verify schedule deployed
-oc get schedule daily-galera-backup -n openstack
+oc get schedule <your-schedule-name> -n openstack
 
 # 2. Check schedule details
-oc describe schedule daily-galera-backup -n openstack
+oc describe schedule <your-schedule-name> -n openstack
 
 # 3. Verify cron expression
-oc get schedule daily-galera-backup -n openstack -o jsonpath='{.spec.schedule}'
+oc get schedule <your-schedule-name> -n openstack -o jsonpath='{.spec.schedule}'
 
 # 4. Check suspend status (should be false)
-oc get schedule daily-galera-backup -n openstack -o jsonpath='{.spec.suspend}'
+oc get schedule <your-schedule-name> -n openstack -o jsonpath='{.spec.suspend}'
 ```
 
 **Expected Results:**
 - [ ] Schedule exists
-- [ ] Cron expression is "0 2 * * *" (2 AM daily)
+- [ ] Cron expression matches your intended schedule
 - [ ] suspend = false
 - [ ] References correct BackupPlan
 
@@ -889,7 +891,7 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
 - [ ] Cluster health maintained across all tests
 - [ ] Post-hook recovery verified
 - [ ] Failure scenarios tested
-- [ ] Schedule configured correctly
+- [ ] Schedule configured (if using automated backups)
 - [ ] Monitoring/alerting plan defined
 - [ ] Runbook reviewed by operations team
 - [ ] Escalation procedures documented
