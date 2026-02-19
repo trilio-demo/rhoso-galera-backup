@@ -14,7 +14,7 @@ MariaDB Galera cluster in a Red Hat OpenStack Services on OpenShift 18 environme
 | File | Purpose | Use |
 |------|---------|-----|
 | `galera-backup-hook.yaml` | Trilio for Kubernetes Hook CR | Deploy to enable consistent backups |
-| `galera-backup-plan.yaml` | Trilio for Kubernetes BackupPlan CR | Deploy to configure backup schedule and targets |
+| `galera-backup-plan.yaml` | Trilio for Kubernetes BackupPlan CR | Deploy to configure backup plan with targets |
 | `galera-health-check.sh` | Read-only cluster health check | Run anytime to verify cluster + OpenStack health |
 | `galera-real-disaster-tests.md` | Disaster recovery test guide | Full procedures, observed results, production caveats |
 | `galera-backup-runbook.md` | Operational runbook | Day-to-day operations reference |
