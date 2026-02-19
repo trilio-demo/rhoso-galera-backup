@@ -1,0 +1,78 @@
+apiVersion: triliovault.trilio.io/v1
+kind: BackupPlan
+metadata:
+  name: openstack-galera-backup
+  namespace: openstack
+spec:
+  backupConfig:
+    target:
+      name: sa-lab-nfs-share1 # CHANGE THIS TO YOUR TARGET
+      namespace: openstack
+
+  backupPlanComponents:
+    customSelector:
+      selectResources:
+        gvkSelector:
+        - groupVersionKind:
+            group: apps
+            kind: StatefulSet
+            version: v1
+          objects:
+            - openstack-galera
+
+        - groupVersionKind:
+            group: ""
+            kind: PersistentVolumeClaim
+            version: v1
+          objects:
+            - mysql-db-openstack-galera-0
+
+        - groupVersionKind:
+            group: ""
+            kind: Secret
+            version: v1
+          objects:
+            - osp-secret
+            - combined-ca-bundle
+
+        - groupVersionKind:
+            group: ""
+            kind: Service
+            version: v1
+          objects:
+            - openstack-galera
+
+        - groupVersionKind:
+            group: ""
+            kind: ServiceAccount
+            version: v1
+          objects:
+            - galera-openstack
+
+        - groupVersionKind:
+            group: ""
+            kind: ConfigMap
+            version: v1
+          objects:
+            - openstack-config-data
+
+      excludeResources:
+        gvkSelector:
+        - groupVersionKind:
+            group: ""
+            kind: PersistentVolumeClaim
+            version: v1
+          objects:
+            - mysql-db-openstack-galera-1
+            - mysql-db-openstack-galera-2
+
+  hookConfig:
+    mode: Sequential
+    hooks:
+      - hook:
+          name: galera-backup-hook
+        podSelector:
+          labels:
+            - matchLabels:
+                statefulset.kubernetes.io/pod-name: "openstack-galera-0"
+        containerRegex: "galera"
