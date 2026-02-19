@@ -225,12 +225,12 @@ oc get restore -n openstack -w
 ## 📝 Key Configuration
 
 ### Backup Window
-- **Scheduled:** Daily at 2:00 AM
+- **Scheduled:** Intentionally, there is no schedule set
 - **Duration:** ~15 seconds (desync window)
 - **Impact:** Minimal - 2 nodes remain active
 
 ### Retention
-- **Policy:** Keep last 7 backups
+- **Policy:** Intentionally, there is no retention set
 - **Rotation:** Automatic via TrilioVault
 
 ### Resources Backed Up
@@ -267,7 +267,7 @@ oc get restore -n openstack -w
 
 **TrilioVault Support:**
 - Email: support@trilio.io
-- Portal: https://support.trilio.io
+- Portal: https://trilio.my.site.com/io/s/
 - Docs: https://docs.trilio.io
 
 **Red Hat Support:**
