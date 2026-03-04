@@ -459,9 +459,12 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
 **Steps:**
 
 ```bash
-# 1. Scale down Galera cluster via OSCP (do NOT use oc scale - operator will override it)
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":0}}}}}'
+# 1. Scale down Galera cluster
+# NOTE: On RHOSO 18.0.2+ (operator v1.0.3+), replicas: 0 is blocked at the CRD level.
+# You must scale down both operators first, then scale the StatefulSet directly.
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=0
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=0
+oc scale statefulset openstack-galera -n openstack --replicas=0
 
 # 2. Wait for all pods to terminate
 oc get pods -n openstack -l app=galera -w
@@ -495,9 +498,10 @@ oc get restore -n openstack -w
 # 6. Wait for restore to complete (status: "Completed")
 oc get restore restore-galera-$(date +%Y%m%d-%H%M) -n openstack
 
-# 7. Scale up Galera cluster via OSCP
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":3}}}}}'
+# 7. Scale up Galera cluster and restore operators
+oc scale statefulset openstack-galera -n openstack --replicas=3
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=1
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=1
 
 # 8. Wait for all pods to be Running
 oc get pods -n openstack -l app=galera -w

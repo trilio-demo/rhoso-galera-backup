@@ -715,9 +715,12 @@ echo "Will restore from: $BACKUP_TO_RESTORE"
 oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
   'mysql -u root -p"${DB_ROOT_PASSWORD}" -e "SHOW DATABASES;"' > /tmp/pre-restore-dbs.txt
 
-# 3. Scale down Galera cluster via OSCP (do NOT use oc scale - operator will override it)
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":0}}}}}'
+# 3. Scale down Galera cluster
+# NOTE: On RHOSO 18.0.2+ (operator v1.0.3+), replicas: 0 is blocked at the CRD level.
+# Scale down both operators first, then scale the StatefulSet directly.
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=0
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=0
+oc scale statefulset openstack-galera -n openstack --replicas=0
 
 # 4. Wait for pods to terminate
 oc get pods -n openstack -l app=galera -w
@@ -751,9 +754,10 @@ EOF
 # 8. Monitor restore (will take 30-120 minutes depending on data size)
 oc get restore -n openstack -w
 
-# 9. After restore completes, scale up cluster via OSCP
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":3}}}}}'
+# 9. After restore completes, scale up cluster and restore operators
+oc scale statefulset openstack-galera -n openstack --replicas=3
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=1
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=1
 
 # 10. Wait for pods to start
 oc get pods -n openstack -l app=galera -w

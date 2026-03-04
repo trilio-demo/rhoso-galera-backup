@@ -109,17 +109,36 @@ Setting `replicas: 0` achieves the same result — zero running pods — without
 triggering the dependency check. The service remains "enabled" in the operator's
 view but has no running instances.
 
+**RHOSO 18.0.2+ (operator v1.0.3+) update:** `replicas: 0` is now blocked at
+the Galera CRD validation level — the CRD webhook enforces a minimum of 1 and
+only accepts values of 1 or 3. The workaround is to scale down both the
+`mariadb-operator-controller-manager` and `openstack-operator-controller-manager`
+deployments first, then scale the StatefulSet directly:
+
+```bash
+# Scale down
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=0
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=0
+oc scale statefulset openstack-galera -n openstack --replicas=0
+
+# Scale back up
+oc scale statefulset openstack-galera -n openstack --replicas=3
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=1
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=1
+```
+
 ---
 
 ## Why `oc patch openstackcontrolplane` instead of `oc scale statefulset`?
 
-The Galera StatefulSet is fully managed by the OSCP operator. If you scale the
-StatefulSet directly with `oc scale`, the operator detects the drift and
-immediately reconciles it back to the desired replica count. Your scale operation
-is overwritten within seconds.
+The Galera StatefulSet is fully managed by two operators: `openstack-operator-controller-manager`
+(OSCP) and `mariadb-operator-controller-manager`. If you scale the StatefulSet
+directly without stopping both operators first, they detect the drift and
+immediately reconcile it back to the desired replica count within seconds.
 
-The only reliable way to scale Galera up or down is to update the desired state
-in the `openstackcontrolplane` CR. The operator then applies the change itself.
+On RHOSO versions prior to 18.0.2, the reliable way to scale Galera was to
+patch the `openstackcontrolplane` CR with `replicas: 0`. On 18.0.2+ this is
+blocked, requiring the operator scale-down approach documented above.
 
 ---
 
