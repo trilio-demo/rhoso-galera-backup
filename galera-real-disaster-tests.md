@@ -329,25 +329,67 @@ oc exec openstack-galera-0 -n galera-restore-test -c galera -- \
 # Should show non-trivial sizes matching a real OpenStack deployment
 
 # ============================================================
-# LEVEL 3: MYSQL QUERY VERIFICATION (best-effort)
-# May work if pod starts in single-node bootstrap mode
+# LEVEL 3: MYSQL QUERY VERIFICATION (validated debug pod method)
+# The restored pods crash-loop in an isolated namespace because
+# there is no OSCP operator managing them. Use a debug pod to
+# access the data directly from the PVC instead.
 # ============================================================
 
-# 12. Try MySQL query - succeeds if pod starts, fails gracefully if not
-oc exec openstack-galera-0 -n galera-restore-test -c galera -- bash -c \
-  'mysql -u root -p"${DB_ROOT_PASSWORD}" --connect-timeout=10 -e "
-    SELECT table_schema, COUNT(*) as table_count
-    FROM information_schema.tables
-    WHERE table_schema NOT IN (\"information_schema\",\"performance_schema\",\"mysql\",\"sys\")
-    GROUP BY table_schema ORDER BY table_schema;"' 2>/dev/null \
-  && echo "MySQL responded - compare table counts against production baseline" \
-  || echo "MySQL did not respond (expected in isolated namespace - filesystem checks above are sufficient)"
+# 12. Delete the crash-looping StatefulSet (keeps PVCs intact)
+oc -n galera-restore-test delete sts openstack-galera
+
+# 13. Get the correct MariaDB image from your cluster
+GALERA_IMAGE=$(oc get galera openstack -n openstack -o jsonpath='{.spec.containerImage}')
+echo "Using image: ${GALERA_IMAGE}"
+
+# 14. Create a debug pod mounting the restored PVC
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: galera-debug-mysql
+  namespace: galera-restore-test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: mariadb
+      image: ${GALERA_IMAGE}
+      command: ["/bin/bash", "-c", "sleep infinity"]
+      volumeMounts:
+        - name: mysql-data
+          mountPath: /var/lib
+      env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: osp-secret
+              key: DbRootPassword
+  volumes:
+    - name: mysql-data
+      persistentVolumeClaim:
+        claimName: mysql-db-openstack-galera-0
+EOF
+
+# 15. Wait for debug pod to be Running
+oc get pod galera-debug-mysql -n galera-restore-test -w
+
+# 16. Exec into the debug pod
+oc -n galera-restore-test rsh galera-debug-mysql
+
+# 17. Inside the pod - start MySQL manually and query data
+mysqld_safe --datadir=/var/lib/mysql --skip-networking --skip-grant-tables &
+# Wait a few seconds for mysqld to start, then:
+mysql -u root
+# Run your queries:
+#   show databases;
+#   use keystone; show tables;
+#   SELECT * FROM project LIMIT 5;
 
 # ============================================================
 # CLEANUP
 # ============================================================
 
-# 13. Cleanup
+# 18. Cleanup
 oc delete namespace galera-restore-test
 ```
 
@@ -358,14 +400,14 @@ oc delete namespace galera-restore-test
 | Restore status | `Completed` |
 | PVC status | `Bound` |
 | All resources | Present (see note below) |
-| Pod status | Running (but not Ready — expected) |
+| Pod status | Running (but not Ready — expected, crash-loop before debug pod) |
 | Pod restart reason | `Startup probe failed: waiting for gcomm URI` — expected |
 | `grastate.dat` exists | Yes |
 | `grastate.dat` seqno | `-1` — expected (see note below) |
 | `grastate.dat` uuid | Non-zero UUID |
 | `ibdata1` size | ~76M |
 | Database directories | All 10 present with files |
-| MySQL query | Will NOT respond — expected in isolated namespace |
+| MySQL query via debug pod | Responds after `mysqld_safe --skip-networking --skip-grant-tables` |
 
 **Why seqno is -1 (this is correct and expected):**
 Galera writes `-1` to `grastate.dat` while the node is *running* — it's a
