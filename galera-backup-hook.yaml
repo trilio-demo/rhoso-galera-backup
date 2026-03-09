@@ -13,14 +13,17 @@ spec:
         set -e
         
         # Log function for consistent output
+        LOGFILE=/tmp/trilio-galera-hook.log
         log() { 
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-            logger -p user.info -t trilio-backup "$1"
+            MSG="[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] $1"
+            echo "$MSG" | tee -a "$LOGFILE" > /proc/1/fd/1
+            
         }
         
         log_err() {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2
-            logger -p user.err -t trilio-backup "ERROR: $1"
+            MSG="[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1"
+            echo "$MSG" | tee -a "$LOGFILE" > /proc/1/fd/2
+            
         }
         
         # Only galera-0 is the designated backup node
@@ -243,14 +246,15 @@ spec:
         set -e
         
         # Log function
+        LOGFILE=/tmp/trilio-galera-hook.log
         log() { 
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-            logger -p user.info -t trilio-backup "$1"
+            MSG="[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] $1"
+            echo "$MSG" | tee -a "$LOGFILE" > /proc/1/fd/1
         }
         
         log_err() {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2
-            logger -p user.err -t trilio-backup "ERROR: $1"
+            MSG="[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1"
+            echo "$MSG" | tee -a "$LOGFILE" > /proc/1/fd/2
         }
         
         # Only run on the node that was desynced

@@ -381,7 +381,7 @@ oc logs openstack-galera-0 -n openstack -c galera --since=10m | grep trilio-back
 oc get backup <backup-name> -n openstack -o yaml
 
 # 2. Verify completion percentage
-oc get backup <backup-name> -n openstack -o jsonpath='{.status.percentageComplete}'
+oc get backup <backup-name> -n openstack -o jsonpath='{.status.percentageCompletion}'
 
 # 3. Check what was backed up
 oc get backup <backup-name> -n openstack -o jsonpath='{.status.backupComponents}' | jq
@@ -394,7 +394,7 @@ oc describe backup <backup-name> -n openstack | grep -i "size\|status\|complete"
 ```
 
 **Expected Results:**
-- [ ] percentageComplete = 100
+- [ ] percentageCompletion = 100
 - [ ] Status = "Available"
 - [ ] Only galera-0 PVC is included
 - [ ] galera-1 and galera-2 PVCs are excluded

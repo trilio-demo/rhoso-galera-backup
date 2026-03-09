@@ -62,9 +62,12 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
 # EXECUTE DISASTER
 # ============================================================
 
-# 1. Scale down via OSCP (StatefulSet is operator-managed)
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":0}}}}}'
+# 1. Scale down Galera
+# # NOTE: On RHOSO 18.0.2+ (operator v1.0.3+), replicas: 0 is blocked by CRD webhook.
+# Scale down both operators first, then scale the StatefulSet directly.
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=0
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=0
+oc scale statefulset openstack-galera -n openstack --replicas=0
 
 # 2. Wait for pods to terminate
 oc wait --for=delete pod/openstack-galera-0 \
@@ -82,11 +85,12 @@ oc get pvc -n openstack | grep galera
 # RECOVERY (self-healing via SST)
 # ============================================================
 
-# 5. Scale back up via OSCP - galera-0 gets a fresh empty PVC
+# 5. Scale back up - galera-0 gets a fresh empty PVC
 #    galera-1 and galera-2 have their data and will form the cluster.
 #    galera-0 detects empty datadir and requests SST from a donor.
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":3}}}}}'
+oc scale statefulset openstack-galera -n openstack --replicas=3
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=1
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=1
 
 # 6. Wait for pod to initialize, then watch SST progress
 #    (pod takes ~10s to start - "PodInitializing" is expected initially)
@@ -148,9 +152,12 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
 # EXECUTE DISASTER
 # ============================================================
 
-# 1. Scale down via OSCP
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":0}}}}}'
+# 1. Scale down Galera
+# NOTE: On RHOSO 18.0.2+ (operator v1.0.3+), replicas: 0 is blocked by CRD webhook.
+# Scale down both operators first, then scale the StatefulSet directly.
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=0
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=0
+oc scale statefulset openstack-galera -n openstack --replicas=0
 oc wait --for=delete pod/openstack-galera-0 \
   pod/openstack-galera-1 \
   pod/openstack-galera-2 \
@@ -164,12 +171,13 @@ oc delete pvc mysql-db-openstack-galera-1 -n openstack
 # RECOVERY (self-healing via SST from single survivor)
 # ============================================================
 
-# 3. Scale back up via OSCP
+# 3. Scale back up
 #    galera-2 has data and bootstraps the cluster.
 #    galera-0 and galera-1 get empty PVCs and SST from galera-2.
 #    NOTE: SST is sequential - only 1 joiner at a time gets served.
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":3}}}}}'
+oc scale statefulset openstack-galera -n openstack --replicas=3
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=1
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=1
 
 # 4. Monitor - galera-0 and galera-1 should SST from galera-2
 sleep 15
@@ -581,14 +589,14 @@ done
 # RECOVERY: Restore from pre-corruption backup
 # ============================================================
 
-# NOTE: Do NOT use `enabled: false` — OSCP validation blocks it because
-# Keystone, Glance, Cinder and other services declare a dependency on Galera.
-# Use replicas: 0 instead. The operator keeps the StatefulSet at 0 replicas
-# while we restore the PVCs, then we scale back up.
+# NOTE: On RHOSO 18.0.2+ (operator v1.0.3+), replicas: 0 is blocked by CRD webhook.
+# Both `enabled: false` and `replicas: 0` are rejected. Scale down both operators
+# first, then scale the StatefulSet directly.
 
-# 1. Scale Galera to 0 via OSCP
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":0}}}}}'
+# 1. Scale down Galera
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=0
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=0
+oc scale statefulset openstack-galera -n openstack --replicas=0
 
 oc wait --for=delete pod/openstack-galera-0 \
   pod/openstack-galera-1 \
@@ -625,8 +633,9 @@ EOF
 oc get restore restore-corruption-recovery -n openstack -w
 
 # 5. After restore completes, scale Galera back to 3
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":3}}}}}'
+oc scale statefulset openstack-galera -n openstack --replicas=3
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=1
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=1
 
 # 6. Check what was recreated
 oc get statefulset,pvc -n openstack | grep galera
@@ -755,10 +764,12 @@ Keystone, Glance, Cinder, Nova, Neutron, Placement, Horizon, Barbican.
 Attempting `oc patch openstackcontrolplane ... '{"spec":{"galera":{"enabled":false}}}'`
 produces a validation error listing all dependent services.
 
-**Solution for restore tests:** Use `replicas: 0` to scale down pods without
-disabling Galera in the operator. Add `skipIfAlreadyExists: true` to the Restore
-CR so the restore skips the still-present StatefulSet and focuses on recreating
-the deleted PVCs. Then scale back to `replicas: 3`.
+**Solution for restore tests (RHOSO 18.0.2+):** `replicas: 0` is blocked by the
+Galera CRD webhook. Scale down `mariadb-operator-controller-manager` and
+`openstack-operator-controller-manager` first, then scale the StatefulSet directly
+to 0. Add `skipIfAlreadyExists: true` to the Restore CR so the restore skips the
+still-present StatefulSet and focuses on recreating the deleted PVCs. Scale the
+StatefulSet back to 3 and restore both operators when done.
 
 ### Bootstrap After Restore
 The backup PVC is snapshotted while MySQL is running (hook locks tables but does
