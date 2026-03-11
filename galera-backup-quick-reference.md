@@ -311,7 +311,7 @@ Backup failed?
 │  └─ Check connection count, network, or schedule during lower traffic
 │
 └─ Other error?
-   └─ Check Trilio for Kubernetes logs: oc logs -n trilio-system -l app=k8s-triliovault
+   └─ Check Trilio for Kubernetes logs: oc logs -n trilio-system -l app=k8s-triliovault-control-plane
 ```
 
 ---

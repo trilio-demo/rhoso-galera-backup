@@ -155,9 +155,12 @@ Glance, and Heat — with audit commands for each.
 ### Quick restore reference
 
 ```bash
-# Scale Galera to 0 (use replicas:0, NOT enabled:false — OSCP blocks it)
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":0}}}}}'
+# Scale Galera to 0
+# NOTE: On RHOSO 18.0.2+ (operator v1.0.3+), replicas: 0 is blocked by CRD webhook.
+# Scale down both operators first, then scale the StatefulSet directly.
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=0
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=0
+oc scale statefulset openstack-galera -n openstack --replicas=0
 
 # Delete corrupted PVCs
 oc delete pvc mysql-db-openstack-galera-{0,1,2} -n openstack
@@ -184,8 +187,9 @@ EOF
 oc get restore galera-restore -n openstack -w
 
 # Scale back up after restore completes
-oc patch openstackcontrolplane openstack-controlplane -n openstack \
-  --type=merge -p '{"spec":{"galera":{"templates":{"openstack":{"replicas":3}}}}}'
+oc scale statefulset openstack-galera -n openstack --replicas=3
+oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=1
+oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=1
 ```
 
 ---
@@ -216,11 +220,12 @@ Run the health check script at any time — it is read-only and safe in producti
 All 3 nodes have identical data. Backing up all 3 would triple storage costs
 with no benefit. galera-1 and galera-2 resync via SST on restore.
 
-**Why `replicas: 0` instead of `enabled: false` for restore?**
-OSCP validation blocks `enabled: false` on Galera because Keystone, Glance,
-Cinder, Nova, Neutron, Placement, Horizon, and Barbican all declare hard
-dependencies. `replicas: 0` achieves the same effect without triggering
-the validation error.
+**Why scale down operators instead of patching `replicas: 0`?**
+On RHOSO 18.0.2+ (operator v1.0.3+), both `enabled: false` and `replicas: 0`
+are blocked by the Galera CRD webhook (only values 1 and 3 are accepted).
+The workaround is to stop both `mariadb-operator-controller-manager` and
+`openstack-operator-controller-manager`, then scale the StatefulSet directly
+to 0. Scale operators back up after the restore completes.
 
 **Why `skipIfAlreadyExists: true` on the Restore CR?**
 When restoring to the same namespace, the StatefulSet still exists (at 0

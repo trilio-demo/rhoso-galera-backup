@@ -210,7 +210,7 @@ oc logs openstack-galera-0 -n openstack -c galera --since=2h | grep trilio-backu
 oc get backup <backup-name> -n openstack -o jsonpath='{.status.status}'
 
 # Check completion percentage
-oc get backup <backup-name> -n openstack -o jsonpath='{.status.percentageComplete}'
+oc get backup <backup-name> -n openstack -o jsonpath='{.status.percentageCompletion}'
 
 # View backup details
 oc describe backup <backup-name> -n openstack
@@ -290,7 +290,7 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
       SHOW STATUS LIKE \"wsrep_local_state_comment\";"'
 
 # Check Trilio for Kubernetes operator logs
-oc logs -n trilio-system -l app=k8s-triliovault --tail=100
+oc logs -n trilio-system -l app=k8s-triliovault-control-plane --tail=100
 ```
 
 **Resolution:**
@@ -438,9 +438,13 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
 
 3. **Network issues between nodes**
    ```bash
-   # Test connectivity
+   # Test connectivity (ping is not available in Galera pods — use mysql)
    oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
-     'for i in 1 2; do ping -c 3 openstack-galera-$i.openstack-galera; done'
+     'for i in 1 2; do
+        mysql -h openstack-galera-$i.openstack-galera -u root -p"${DB_ROOT_PASSWORD}" \
+          --connect-timeout=5 -e "SELECT 1;" 2>/dev/null \
+          && echo "galera-$i: REACHABLE" || echo "galera-$i: UNREACHABLE"
+      done'
    ```
 
 ---
