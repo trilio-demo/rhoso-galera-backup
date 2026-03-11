@@ -209,6 +209,8 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c '
 - [ ] `Lock released - writes unblocked` printed after lock is released
 - [ ] No `FAIL:` lines in output
 
+> **Note on `ERROR 1047`:** You may see `ERROR 1047 (08S01): Aborting TOI: Replication paused on node for FTWRL/BACKUP STAGE` before the `OK:` line. This is **expected and correct** — Galera is enforcing the lock at the cluster replication layer (TOI), not just the session level. It confirms the lock is working cluster-wide.
+
 ---
 
 ### ✅ Test 4: Trilio for Kubernetes Target Validation
