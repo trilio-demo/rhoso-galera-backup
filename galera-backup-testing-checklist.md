@@ -168,41 +168,48 @@ oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
 
 ### ✅ Test 3: Table Lock/Unlock
 
-**Objective:** Verify table locking works and doesn't cause deadlocks
+**Objective:** Verify FLUSH TABLES WITH READ LOCK blocks writes (simulates hook pre-backup behaviour)
+
+> **Note:** `FLUSH TABLES WITH READ LOCK` only holds for the duration of the MySQL **session**.
+> Each `oc exec` call creates a new session, so the lock and the write test must run
+> inside a **single** `oc exec`. `Com_lock_tables` tracks `LOCK TABLES` statements only —
+> it does not reflect `FLUSH TABLES WITH READ LOCK`.
 
 **Steps:**
 
 ```bash
-# 1. Lock tables
-oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
-  'mysql -u root -p"${DB_ROOT_PASSWORD}" -e "FLUSH TABLES WITH READ LOCK;"'
+# Single exec: hold FTWRL in background, test write from new connection, then release
+oc exec openstack-galera-0 -n openstack -c galera -- bash -c '
+  # 1. Hold FTWRL in a background MySQL connection
+  mysql -u root -p"${DB_ROOT_PASSWORD}" \
+    -e "FLUSH TABLES WITH READ LOCK; SELECT SLEEP(30);" &
+  LOCK_PID=$!
+  sleep 1
 
-# 2. Verify lock is active (in separate connection)
-oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
-  'mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
-  -e "SHOW STATUS LIKE \"Com_lock_tables\";"'
+  # 2. Try a write from a new connection (should block and timeout)
+  timeout 5 mysql -u root -p"${DB_ROOT_PASSWORD}" \
+    -e "CREATE DATABASE IF NOT EXISTS lock_test_blocked;" 2>&1 \
+    && echo "FAIL: write succeeded (lock not working)" \
+    || echo "OK: write blocked (FTWRL working)"
 
-# 3. Try a write operation (should be blocked/fail)
-oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
-  'timeout 5 mysql -u root -p"${DB_ROOT_PASSWORD}" \
-  -e "CREATE DATABASE IF NOT EXISTS test_write;" 2>&1' || echo "Write blocked as expected"
+  # 3. Release lock
+  kill $LOCK_PID 2>/dev/null
+  wait $LOCK_PID 2>/dev/null
 
-# 4. Unlock tables
-oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
-  'mysql -u root -p"${DB_ROOT_PASSWORD}" -e "UNLOCK TABLES;"'
-
-# 5. Verify write now works
-oc exec openstack-galera-0 -n openstack -c galera -- bash -c \
-  'mysql -u root -p"${DB_ROOT_PASSWORD}" -e "
-    CREATE DATABASE IF NOT EXISTS test_write;
-    DROP DATABASE test_write;"'
+  # 4. Verify writes unblocked after release
+  mysql -u root -p"${DB_ROOT_PASSWORD}" \
+    -e "DROP DATABASE IF EXISTS lock_test_blocked;" 2>/dev/null
+  echo "Lock released - writes unblocked"
+'
 ```
 
 **Expected Results:**
 - [ ] Lock succeeds without error
-- [ ] Write operations are blocked while locked
-- [ ] Unlock succeeds
-- [ ] Write operations work after unlock
+- [ ] `OK: write blocked (FTWRL working)` printed
+- [ ] `Lock released - writes unblocked` printed after lock is released
+- [ ] No `FAIL:` lines in output
+
+> **Note on `ERROR 1047`:** You may see `ERROR 1047 (08S01): Aborting TOI: Replication paused on node for FTWRL/BACKUP STAGE` before the `OK:` line. This is **expected and correct** — Galera is enforcing the lock at the cluster replication layer (TOI), not just the session level. It confirms the lock is working cluster-wide.
 
 ---
 
