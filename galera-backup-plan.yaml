@@ -26,6 +26,8 @@ spec:
             version: v1
           objects:
             - mysql-db-openstack-galera-0
+            - mysql-db-openstack-galera-1
+            - mysql-db-openstack-galera-2
 
         - groupVersionKind:
             group: ""
@@ -40,7 +42,8 @@ spec:
             kind: Service
             version: v1
           objects:
-            - openstack-galera
+            - openstack-galera   # headless, DNS for the pods
+            - openstack          # ClusterIP; its selector records which pod was active at backup time
 
         - groupVersionKind:
             group: ""
@@ -56,16 +59,6 @@ spec:
           objects:
             - openstack-config-data
 
-      excludeResources:
-        gvkSelector:
-        - groupVersionKind:
-            group: ""
-            kind: PersistentVolumeClaim
-            version: v1
-          objects:
-            - mysql-db-openstack-galera-1
-            - mysql-db-openstack-galera-2
-
   hookConfig:
     mode: Sequential
     hooks:
@@ -74,5 +67,5 @@ spec:
         podSelector:
           labels:
             - matchLabels:
-                statefulset.kubernetes.io/pod-name: "openstack-galera-0"
+                app: galera
         containerRegex: "galera"

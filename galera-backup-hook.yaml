@@ -11,232 +11,254 @@ spec:
       - -c
       - |
         set -e
-        
-        # Log function for consistent output
+
+        # ── Logging ──────────────────────────────────────────────────────────
         LOGFILE=/tmp/trilio-galera-hook.log
-        log() { 
+        log() {
             MSG="[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] $1"
             echo "$MSG" | tee -a "$LOGFILE" > /proc/1/fd/1
-            
         }
-        
         log_err() {
             MSG="[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1"
             echo "$MSG" | tee -a "$LOGFILE" > /proc/1/fd/2
-            
         }
-        
-        # Only galera-0 is the designated backup node
-        if [[ "$(hostname)" != "openstack-galera-0" ]]; then
-            log "Not the designated backup node. Exiting."
+
+        MY_HOSTNAME=$(hostname)
+        log "Hook started on $MY_HOSTNAME"
+
+        # ── STEP 0: MySQL root credentials ───────────────────────────────────
+        # RHOSO 18.0.x up to FR3 exposes DB_ROOT_PASSWORD as a container env var.
+        # From FR4 on (mariadb-operator commit 3527102) the env var is gone and
+        # the operator scripts source /var/lib/operator-scripts/mysql_root_auth.sh,
+        # which exports MYSQL_PWD. Support both; every mysql call below relies on
+        # MYSQL_PWD.
+        if [ -n "${DB_ROOT_PASSWORD:-}" ]; then
+            export MYSQL_PWD="${DB_ROOT_PASSWORD}"
+        elif [ -f /var/lib/operator-scripts/mysql_root_auth.sh ]; then
+            set +e
+            source /var/lib/operator-scripts/mysql_root_auth.sh
+            set -e
+        fi
+        if [ -z "${MYSQL_PWD:-}" ]; then
+            log_err "No MySQL root credentials (DB_ROOT_PASSWORD env or mysql_root_auth.sh). Aborting."
+            exit 1
+        fi
+
+        # ── STEP 1: Identify the active pod via Service selector ─────────────
+        # RHOSO exposes Galera as active/passive: the mariadb-operator sets a
+        # statefulset.kubernetes.io/pod-name label on the ClusterIP Service so
+        # it routes to exactly one pod at a time. We must NEVER quiesce that pod
+        # or its readiness probe will fail, Kubernetes will remove it from the
+        # endpoints, and the entire OpenStack control plane loses its DB.
+
+        TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+        CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        NS=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+        # ClusterIP Service name == Galera CR name (mariadb-operator pkg/mariadb/service.go;
+        # the operator's own mysql_wsrep_notify.sh derives it as ${HOSTNAME/-galera-[0-9]*/}).
+        # The headless Service is "<cr>-galera" and does NOT carry the pod-name selector.
+        GALERA_SVC="${HOSTNAME/-galera-[0-9]*/}"
+
+        ACTIVE=$(curl -sk --cacert "$CA" \
+          -H "Authorization: Bearer $TOKEN" \
+          "https://kubernetes.default.svc/api/v1/namespaces/${NS}/services/${GALERA_SVC}" \
+          | python3 -c \
+            'import json,sys; s=json.load(sys.stdin); \
+             print(s["spec"]["selector"].get("statefulset.kubernetes.io/pod-name",""))' \
+          2>/dev/null)
+
+        if [ -z "$ACTIVE" ]; then
+            log_err "Could not determine active pod from Service selector. Aborting."
+            exit 1
+        fi
+
+        log "Active pod (Service endpoint): $ACTIVE"
+
+        # Never quiesce the active pod
+        if [ "$MY_HOSTNAME" = "$ACTIVE" ]; then
+            log "This is the active pod. Skipping to avoid outage."
             exit 0
         fi
-        
-        log "Starting pre-backup operations on galera-0"
-        
-        #########################################################################
-        # STEP 1: Pre-Flight Cluster Health Checks
-        #########################################################################
-        
+
+        # ── STEP 2: Select the preferred passive pod ─────────────────────────
+        # Use the highest-ordinal non-active pod so exactly one pod proceeds.
+        # All three pods compute the same answer independently.
+
+        ACTIVE_ORDINAL="${ACTIVE##*-}"
+        MY_ORDINAL="${MY_HOSTNAME##*-}"
+
+        PREFERRED=""
+        for ord in 2 1 0; do
+            if [ "$ord" != "$ACTIVE_ORDINAL" ]; then
+                PREFERRED=$ord
+                break
+            fi
+        done
+
+        if [ "$MY_ORDINAL" != "$PREFERRED" ]; then
+            log "Not the preferred backup pod (preferred ordinal: $PREFERRED, active: $ACTIVE). Skipping."
+            exit 0
+        fi
+
+        log "Selected as backup pod (ordinal $MY_ORDINAL, active is $ACTIVE)"
+
+        # ── STEP 3: Pre-flight cluster health checks ─────────────────────────
+
         log "Checking cluster health..."
-        
-        # Check cluster size (must be 3 for safe desync)
-        CLUSTER_SIZE=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+
+        CLUSTER_SIZE=$(mysql -u root -sN \
             -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | awk '{print $2}')
-        
+
         if [ -z "$CLUSTER_SIZE" ]; then
             log_err "Failed to query cluster size - MySQL may be down"
             exit 1
         fi
-        
+
         if [ "$CLUSTER_SIZE" != "3" ]; then
-            log_err "Cluster is degraded ($CLUSTER_SIZE/3 nodes)"
-            log_err "Cannot safely desync - would break quorum"
+            log_err "Cluster is degraded ($CLUSTER_SIZE/3 nodes). Cannot safely quiesce."
             exit 1
         fi
-        
-        log "✓ Cluster size: $CLUSTER_SIZE/3 (healthy)"
-        
-        # Check this node is synced
-        LOCAL_STATE=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+
+        LOCAL_STATE=$(mysql -u root -sN \
             -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | awk '{print $2}')
-        
+
         if [ "$LOCAL_STATE" != "Synced" ]; then
-            log_err "Node is not in Synced state (current: $LOCAL_STATE)"
+            log_err "Node not in Synced state (current: $LOCAL_STATE). Cannot proceed."
             exit 1
         fi
-        
-        log "✓ Local state: $LOCAL_STATE"
-        
-        # Check not already desynced (leftover from failed backup)
-        CURRENT_DESYNC=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+
+        CURRENT_DESYNC=$(mysql -u root -sN \
             -e "SHOW VARIABLES LIKE 'wsrep_desync';" 2>/dev/null | awk '{print $2}')
-        
+
         if [ "$CURRENT_DESYNC" = "ON" ]; then
-            log_err "Node is already desynced (stuck from previous backup)"
+            log_err "Node already desynced (stuck from a previous backup?). Aborting."
             exit 1
         fi
-        
-        log "✓ Not currently desynced"
-        
-        # Log current connection count (for monitoring)
-        INITIAL_CONNS=$(ss -ant | grep :3306 | grep ESTAB | wc -l)
-        log "Current active connections: $INITIAL_CONNS"
-        
-        #########################################################################
-        # STEP 2: Execute Desync
-        #########################################################################
-        
-        log "Executing: SET GLOBAL wsrep_desync = ON"
-        mysql -u root -p"${DB_ROOT_PASSWORD}" -e "SET GLOBAL wsrep_desync = ON;" 2>/dev/null
-        
-        if [ $? -ne 0 ]; then
-            log_err "Failed to execute desync command"
+
+        log "✓ Cluster: $CLUSTER_SIZE/3 nodes, Local state: $LOCAL_STATE, Desync: $CURRENT_DESYNC"
+
+        # ── STEP 4: Quiesce — desync + FTWRL in a long-lived background session
+        # KEY DESIGN: FLUSH TABLES WITH READ LOCK is a session-level lock. It is
+        # released the moment the mysql -e call returns. To hold it across the
+        # entire snapshot we start a background mysql process that keeps the
+        # session open with SELECT SLEEP(). The post-hook kills this process,
+        # which closes the connection and releases both the lock and the session.
+
+        log "Starting background session: SET GLOBAL wsrep_desync = ON + FTWRL..."
+
+        # IMPORTANT: detach stdin/stdout/stderr from the exec session. T4K runs
+        # this hook via the Kubernetes exec API; the exec stream does not return
+        # until every process holding its stdout pipe exits. Without the
+        # redirects the background mysql would keep the pipe open, the pre-hook
+        # would hang until timeoutSeconds and be marked Failed.
+        # lock_wait_timeout bounds how long FTWRL waits for in-flight statements
+        # on this (passive) node, so the hook fails fast instead of hitting the
+        # T4K timeoutSeconds. SLEEP(900) caps how long the lock can outlive a
+        # backup whose post-hook never ran. The SLEEP literal is also the marker
+        # used below to confirm that FTWRL was actually acquired.
+        LOCK_MARKER="SELECT SLEEP(900)"
+        mysql -u root \
+          -e "SET SESSION lock_wait_timeout = 60; SET GLOBAL wsrep_desync = ON; FLUSH TABLES WITH READ LOCK; ${LOCK_MARKER};" \
+          </dev/null >/dev/null 2>&1 &
+        LOCK_PID=$!
+        echo "$LOCK_PID" > /tmp/galera_lock_pid
+
+        # Give MySQL time to execute the statements before we continue
+        sleep 3
+
+        # Verify the background process is still alive. If it died, desync may
+        # already be ON (it is set before FTWRL), so reset it.
+        if ! kill -0 "$LOCK_PID" 2>/dev/null; then
+            log_err "Background lock session died immediately (credentials, lock_wait_timeout?). Aborting."
+            mysql -u root -e "SET GLOBAL wsrep_desync = OFF;" 2>/dev/null || true
+            rm -f /tmp/galera_lock_pid
             exit 1
         fi
-        
-        log "Desync command executed - now verifying it took effect..."
-        
-        #########################################################################
-        # STEP 3: Verify Desync (CRITICAL - Wait for state transition)
-        #########################################################################
-        
+
+        # ── STEP 5: Verify desync took effect AND the lock is held ───────────
+        # Desync is visible immediately, but FTWRL can still be waiting for
+        # in-flight statements. The lock is only held once the session has moved
+        # on to the SLEEP statement, so require that row in PROCESSLIST too.
+
         RETRY=0
-        MAX_RETRIES=30  # 30 retries × 2s = 60 second timeout
+        MAX_RETRIES=35          # 35 x 2s = 70s > lock_wait_timeout (60s)
         DESYNC_VERIFIED=false
-        
+
         while [ $RETRY -lt $MAX_RETRIES ]; do
-            # Check 1: wsrep_desync variable is ON
-            DESYNC_VAR=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+            if ! kill -0 "$LOCK_PID" 2>/dev/null; then
+                log_err "Lock session exited while waiting (FTWRL hit lock_wait_timeout?)."
+                break
+            fi
+            DESYNC_VAR=$(mysql -u root -sN \
                 -e "SHOW VARIABLES LIKE 'wsrep_desync';" 2>/dev/null | awk '{print $2}')
-            
-            # Check 2: Node state (4=Synced, 2=Donor/Desynced)
-            LOCAL_STATE_NUM=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+            LOCAL_STATE_NUM=$(mysql -u root -sN \
                 -e "SHOW STATUS LIKE 'wsrep_local_state';" 2>/dev/null | awk '{print $2}')
-            
-            # Check 3: Desync count incremented (confirms action happened)
-            DESYNC_COUNT=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
-                -e "SHOW STATUS LIKE 'wsrep_desync_count';" 2>/dev/null | awk '{print $2}')
-            
-            # Check 4: Connections have drained
-            ACTIVE_CONNS=$(ss -ant | grep :3306 | grep ESTAB | wc -l)
-            
-            # Check 5: Cluster still has quorum (other 2 nodes voting)
-            CLUSTER_STATUS=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
-                -e "SHOW STATUS LIKE 'wsrep_cluster_status';" 2>/dev/null | awk '{print $2}')
-            
-            log "Verification attempt $((RETRY + 1))/$MAX_RETRIES:"
-            log "  wsrep_desync: $DESYNC_VAR"
-            log "  local_state: $LOCAL_STATE_NUM (4=Synced, 2=Donor/Desynced)"
-            log "  desync_count: $DESYNC_COUNT"
-            log "  active_conns: $ACTIVE_CONNS (initial: $INITIAL_CONNS)"
-            log "  cluster_status: $CLUSTER_STATUS"
-            
-            # Success criteria - ALL must be true:
-            # 1. Variable is ON
-            # 2. State is 2 (Donor/Desynced) OR connections drained
-            # 3. Desync count > 0 (confirms operation executed)
-            # 4. Cluster status is Primary (quorum maintained)
-            # 5. Connections < 5 (only health checks)
-            
-            if [ "$DESYNC_VAR" = "ON" ] && \
-               [ "$DESYNC_COUNT" -gt 0 ] && \
-               [ "$CLUSTER_STATUS" = "Primary" ]; then
-                
-                log "✓✓✓ Desync verification PASSED ✓✓✓"
-                log "  Node successfully desynced"
-                log "  Connections drained ($INITIAL_CONNS → $ACTIVE_CONNS)"
-                log "  Cluster quorum maintained (Status: $CLUSTER_STATUS)"
+            LOCK_HELD=$(mysql -u root -sN \
+                -e "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE INFO LIKE '${LOCK_MARKER}%';" 2>/dev/null)
+
+            if [ "$DESYNC_VAR" = "ON" ] && [ "$LOCAL_STATE_NUM" = "2" ] && [ "${LOCK_HELD:-0}" -ge 1 ]; then
                 DESYNC_VERIFIED=true
                 break
             fi
-            
+
+            log "Waiting for desync + FTWRL... (attempt $((RETRY+1))/$MAX_RETRIES) desync=$DESYNC_VAR state=$LOCAL_STATE_NUM lock_held=${LOCK_HELD:-0}"
             sleep 2
             RETRY=$((RETRY + 1))
         done
-        
-        # Fail if verification didn't pass
+
         if [ "$DESYNC_VERIFIED" = "false" ]; then
-            log_err "Desync verification FAILED after $((MAX_RETRIES * 2)) seconds"
-            log_err "Final state: desync=$DESYNC_VAR, state=$LOCAL_STATE_NUM, conns=$ACTIVE_CONNS"
-            
-            # Attempt to resync before failing
-            log "Attempting to resync node before aborting..."
-            mysql -u root -p"${DB_ROOT_PASSWORD}" -e "SET GLOBAL wsrep_desync = OFF;" 2>/dev/null || true
-            
+            log_err "Desync/FTWRL did not verify within timeout. Releasing and aborting."
+            kill "$LOCK_PID" 2>/dev/null
+            wait "$LOCK_PID" 2>/dev/null
+            mysql -u root -e "SET GLOBAL wsrep_desync = OFF;" 2>/dev/null || true
+            rm -f /tmp/galera_lock_pid
             exit 1
         fi
-        
-        #########################################################################
-        # STEP 4: Flush and Lock Tables (for maximum consistency)
-        #########################################################################
-        
-        log "Executing: FLUSH TABLES WITH READ LOCK"
-        mysql -u root -p"${DB_ROOT_PASSWORD}" -e "FLUSH TABLES WITH READ LOCK;" 2>/dev/null
-        
-        if [ $? -ne 0 ]; then
-            log_err "Failed to lock tables"
-            # Attempt to resync
-            mysql -u root -p"${DB_ROOT_PASSWORD}" -e "SET GLOBAL wsrep_desync = OFF;" 2>/dev/null || true
+
+        log "✓ Node is Donor/Desynced. Lock held by PID $LOCK_PID."
+
+        # ── STEP 6: Failover guard ───────────────────────────────────────────
+        # The mariadb-operator failover script picks the first member without
+        # checking state. If a failover happened between step 1 and now, this
+        # pod may have become active while desynced — check and abort immediately.
+
+        ACTIVE_NOW=$(curl -sk --cacert "$CA" \
+          -H "Authorization: Bearer $TOKEN" \
+          "https://kubernetes.default.svc/api/v1/namespaces/${NS}/services/${GALERA_SVC}" \
+          | python3 -c \
+            'import json,sys; s=json.load(sys.stdin); \
+             print(s["spec"]["selector"].get("statefulset.kubernetes.io/pod-name",""))' \
+          2>/dev/null)
+
+        if [ "$MY_HOSTNAME" = "$ACTIVE_NOW" ]; then
+            log_err "FAILOVER DETECTED: this pod became active during quiesce window. Releasing immediately."
+            kill "$LOCK_PID" 2>/dev/null
+            wait "$LOCK_PID" 2>/dev/null
+            mysql -u root -e "SET GLOBAL wsrep_desync = OFF;" 2>/dev/null || true
+            rm -f /tmp/galera_lock_pid
             exit 1
         fi
-        
-        log "✓ Tables flushed and locked"
-        
-        #########################################################################
-        # STEP 5: Final Verification Before Snapshot
-        #########################################################################
-        
-        # Verify no dirty pages in buffer pool
-        DIRTY_PAGES=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
-            -e "SHOW STATUS LIKE 'Innodb_buffer_pool_pages_dirty';" 2>/dev/null | awk '{print $2}')
-        
-        log "InnoDB dirty pages: $DIRTY_PAGES"
-        
-        if [ "$DIRTY_PAGES" -gt 1000 ]; then
-            log "WARNING: High number of dirty pages ($DIRTY_PAGES)"
-            log "Waiting 5 seconds for flush to complete..."
-            sleep 5
-        fi
-        
-        # Double-check cluster status one more time
-        FINAL_CLUSTER_STATUS=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
-            -e "SHOW STATUS LIKE 'wsrep_cluster_status';" 2>/dev/null | awk '{print $2}')
-        
-        FINAL_CLUSTER_SIZE=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
-            -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | awk '{print $2}')
-        
-        if [ "$FINAL_CLUSTER_STATUS" != "Primary" ] || [ "$FINAL_CLUSTER_SIZE" != "3" ]; then
-            log_err "Cluster status changed during desync!"
-            log_err "Status: $FINAL_CLUSTER_STATUS, Size: $FINAL_CLUSTER_SIZE"
-            
-            # Unlock and resync
-            mysql -u root -p"${DB_ROOT_PASSWORD}" -e "UNLOCK TABLES;" 2>/dev/null || true
-            mysql -u root -p"${DB_ROOT_PASSWORD}" -e "SET GLOBAL wsrep_desync = OFF;" 2>/dev/null || true
-            exit 1
-        fi
-        
-        log "✓ Final cluster verification: Status=$FINAL_CLUSTER_STATUS, Size=$FINAL_CLUSTER_SIZE"
-        
-        #########################################################################
-        # STEP 6: Mark Backup as Ready
-        #########################################################################
-        
-        # Create markers for post-hook
+
+        log "✓ Failover check passed. Active pod is still $ACTIVE_NOW."
+
+        # ── STEP 7: Record state for post-hook ───────────────────────────────
+
         touch /tmp/backup_in_progress
-        echo "locked" > /tmp/backup_table_lock
         echo "$(date +%s)" > /tmp/backup_start_time
-        
+        echo "$MY_HOSTNAME" > /tmp/backup_source_pod
+
         log "=========================================="
         log "PRE-BACKUP HOOK COMPLETED SUCCESSFULLY"
-        log "Node is desynced, tables locked, ready for snapshot"
-        log "Cluster: $FINAL_CLUSTER_SIZE nodes, Status: $FINAL_CLUSTER_STATUS"
+        log "Backup source: $MY_HOSTNAME (passive)"
+        log "Active pod:    $ACTIVE_NOW (untouched)"
+        log "Cluster size:  $CLUSTER_SIZE nodes"
+        log "FTWRL held by: PID $LOCK_PID"
         log "=========================================="
-        
+
     ignoreFailure: false
     maxRetryCount: 1
-    timeoutSeconds: 120
-  
+    timeoutSeconds: 180
+
   post:
     execAction:
       command:
@@ -244,185 +266,133 @@ spec:
       - -c
       - |
         set -e
-        
-        # Log function
+
+        # ── Logging ──────────────────────────────────────────────────────────
         LOGFILE=/tmp/trilio-galera-hook.log
-        log() { 
+        log() {
             MSG="[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] $1"
             echo "$MSG" | tee -a "$LOGFILE" > /proc/1/fd/1
         }
-        
         log_err() {
             MSG="[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1"
             echo "$MSG" | tee -a "$LOGFILE" > /proc/1/fd/2
         }
-        
-        # Only run on the node that was desynced
+
+        # Only run on the pod that was quiesced
         if [ ! -f /tmp/backup_in_progress ]; then
-            log "This node was not desynced. Nothing to do."
+            log "This pod was not quiesced. Nothing to do."
             exit 0
         fi
-        
-        log "Starting post-backup cleanup on galera-0"
-        
-        #########################################################################
-        # STEP 1: Calculate Backup Duration
-        #########################################################################
-        
+
+        # MySQL root credentials (same logic as the pre-hook)
+        if [ -n "${DB_ROOT_PASSWORD:-}" ]; then
+            export MYSQL_PWD="${DB_ROOT_PASSWORD}"
+        elif [ -f /var/lib/operator-scripts/mysql_root_auth.sh ]; then
+            set +e
+            source /var/lib/operator-scripts/mysql_root_auth.sh
+            set -e
+        fi
+        if [ -z "${MYSQL_PWD:-}" ]; then
+            log_err "No MySQL root credentials. Killing lock session anyway; desync must be reset manually."
+            [ -f /tmp/galera_lock_pid ] && kill "$(cat /tmp/galera_lock_pid)" 2>/dev/null || true
+            exit 1
+        fi
+
+        SOURCE_POD=$(cat /tmp/backup_source_pod 2>/dev/null || hostname)
+        log "Post-backup cleanup on $SOURCE_POD"
+
+        # ── STEP 1: Backup duration ───────────────────────────────────────────
+
         if [ -f /tmp/backup_start_time ]; then
             START_TIME=$(cat /tmp/backup_start_time)
-            END_TIME=$(date +%s)
-            DURATION=$((END_TIME - START_TIME))
-            
-            log "Backup duration: ${DURATION} seconds ($((DURATION / 60)) minutes)"
-            
-            if [ $DURATION -gt 7200 ]; then
-                log "WARNING: Backup took longer than 2 hours"
-            fi
+            DURATION=$(( $(date +%s) - START_TIME ))
+            log "Backup duration: ${DURATION}s ($((DURATION / 60))m)"
+            [ $DURATION -gt 7200 ] && log "WARNING: Backup took longer than 2 hours"
         fi
-        
-        #########################################################################
-        # STEP 2: Unlock Tables
-        #########################################################################
-        
-        if [ -f /tmp/backup_table_lock ]; then
-            log "Executing: UNLOCK TABLES"
-            mysql -u root -p"${DB_ROOT_PASSWORD}" -e "UNLOCK TABLES;" 2>/dev/null
-            
-            if [ $? -eq 0 ]; then
-                log "✓ Tables unlocked"
-                rm -f /tmp/backup_table_lock
-            else
-                log_err "Failed to unlock tables"
-                # Continue anyway - resync might fix it
-            fi
-        fi
-        
-        #########################################################################
-        # STEP 3: Check Cluster Health Before Resync
-        #########################################################################
-        
-        log "Checking cluster health before resync..."
-        
-        CLUSTER_SIZE=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
-            -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | awk '{print $2}')
-        
-        CLUSTER_STATUS=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
-            -e "SHOW STATUS LIKE 'wsrep_cluster_status';" 2>/dev/null | awk '{print $2}')
-        
-        log "Current cluster: Size=$CLUSTER_SIZE, Status=$CLUSTER_STATUS"
-        
-        if [ "$CLUSTER_SIZE" -lt 2 ]; then
-            log_err "CRITICAL: Cluster severely degraded (only $CLUSTER_SIZE nodes)"
-            log "Resyncing anyway to help restore quorum..."
-        fi
-        
-        #########################################################################
-        # STEP 4: Resync Node
-        #########################################################################
-        
-        log "Executing: SET GLOBAL wsrep_desync = OFF"
-        mysql -u root -p"${DB_ROOT_PASSWORD}" -e "SET GLOBAL wsrep_desync = OFF;" 2>/dev/null
-        
-        if [ $? -ne 0 ]; then
-            log_err "Failed to execute resync command"
-            # Don't exit - we still want to clean up markers
+
+        # ── STEP 2: Kill background lock session (releases FTWRL) ────────────
+
+        if [ -f /tmp/galera_lock_pid ]; then
+            LOCK_PID=$(cat /tmp/galera_lock_pid)
+            log "Killing background lock session (PID $LOCK_PID)..."
+            kill "$LOCK_PID" 2>/dev/null || true
+            wait "$LOCK_PID" 2>/dev/null || true
+            rm -f /tmp/galera_lock_pid
+            log "✓ Lock session terminated. FTWRL released."
         else
-            log "✓ Resync command executed"
+            log "WARNING: No lock PID file found. Lock may already be released."
         fi
-        
-        #########################################################################
-        # STEP 5: Wait for Node to Rejoin Cluster
-        #########################################################################
-        
-        log "Waiting for node to rejoin cluster and sync..."
-        
-        MAX_WAIT=60  # 60 iterations × 5 seconds = 5 minutes
-        ITERATION=0
+
+        # ── STEP 3: Turn off desync ───────────────────────────────────────────
+        # wsrep_desync is a global variable — it persists after the session that
+        # set it closes, so we must explicitly reset it here.
+
+        log "Executing: SET GLOBAL wsrep_desync = OFF"
+        mysql -u root -e "SET GLOBAL wsrep_desync = OFF;" 2>/dev/null \
+            && log "✓ wsrep_desync = OFF" \
+            || log_err "Failed to reset wsrep_desync. Manual intervention may be needed."
+
+        # ── STEP 4: Wait for node to resync ──────────────────────────────────
+
+        log "Waiting for node to rejoin cluster..."
+
+        MAX_WAIT=36
+        ITER=0
         REJOIN_SUCCESS=false
-        
-        while [ $ITERATION -lt $MAX_WAIT ]; do
-            # Check sync status
-            LOCAL_STATE=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+
+        while [ $ITER -lt $MAX_WAIT ]; do
+            LOCAL_STATE=$(mysql -u root -sN \
                 -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | awk '{print $2}')
-            
-            # Check receive queue (shows catch-up progress)
-            RECV_QUEUE=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+            RECV_QUEUE=$(mysql -u root -sN \
                 -e "SHOW STATUS LIKE 'wsrep_local_recv_queue';" 2>/dev/null | awk '{print $2}')
-            
-            # Check cluster size
-            CURRENT_SIZE=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
-                -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | awk '{print $2}')
-            
-            ELAPSED=$((ITERATION * 5))
-            
+
             if [ "$LOCAL_STATE" = "Synced" ]; then
-                log "✓✓✓ Node successfully resynced ✓✓✓"
-                log "  Time to resync: ${ELAPSED} seconds"
-                log "  Cluster size: $CURRENT_SIZE"
-                log "  Local state: $LOCAL_STATE"
+                log "✓ Node resynced in $((ITER * 5))s"
                 REJOIN_SUCCESS=true
                 break
             fi
-            
-            log "Resyncing... (${ELAPSED}s) state=$LOCAL_STATE, recv_queue=$RECV_QUEUE, cluster_size=$CURRENT_SIZE"
-            
+
+            log "Resyncing... ($((ITER * 5))s) state=$LOCAL_STATE recv_queue=$RECV_QUEUE"
             sleep 5
-            ITERATION=$((ITERATION + 1))
+            ITER=$((ITER + 1))
         done
-        
-        if [ "$REJOIN_SUCCESS" = "false" ]; then
-            log_err "WARNING: Resync did not complete within 5 minutes"
-            log_err "Current state: $LOCAL_STATE"
-            log_err "This may indicate high write traffic during backup"
-            log_err "Node will continue resyncing in the background"
-        fi
-        
-        #########################################################################
-        # STEP 6: Verify Final Cluster State
-        #########################################################################
-        
-        FINAL_CLUSTER_SIZE=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+
+        [ "$REJOIN_SUCCESS" = "false" ] && \
+            log_err "WARNING: Resync not complete within 5 min. Node will continue in background."
+
+        # ── STEP 5: Final cluster check ───────────────────────────────────────
+
+        FINAL_SIZE=$(mysql -u root -sN \
             -e "SHOW STATUS LIKE 'wsrep_cluster_size';" 2>/dev/null | awk '{print $2}')
-        
-        FINAL_CLUSTER_STATUS=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+        FINAL_STATUS=$(mysql -u root -sN \
             -e "SHOW STATUS LIKE 'wsrep_cluster_status';" 2>/dev/null | awk '{print $2}')
-        
-        FINAL_LOCAL_STATE=$(mysql -u root -p"${DB_ROOT_PASSWORD}" -sN \
+        FINAL_LOCAL=$(mysql -u root -sN \
             -e "SHOW STATUS LIKE 'wsrep_local_state_comment';" 2>/dev/null | awk '{print $2}')
-        
-        log "Final cluster state:"
-        log "  Size: $FINAL_CLUSTER_SIZE/3"
-        log "  Status: $FINAL_CLUSTER_STATUS"
-        log "  Local state: $FINAL_LOCAL_STATE"
-        
-        #########################################################################
-        # STEP 7: Cleanup Markers
-        #########################################################################
-        
-        rm -f /tmp/backup_in_progress
-        rm -f /tmp/backup_table_lock
-        rm -f /tmp/backup_start_time
-        
-        #########################################################################
-        # STEP 8: Final Status
-        #########################################################################
-        
-        if [ "$FINAL_CLUSTER_SIZE" = "3" ] && [ "$FINAL_LOCAL_STATE" = "Synced" ]; then
+
+        log "Final cluster state: Size=$FINAL_SIZE, Status=$FINAL_STATUS, Local=$FINAL_LOCAL"
+
+        # ── STEP 6: Cleanup markers ───────────────────────────────────────────
+
+        rm -f /tmp/backup_in_progress /tmp/backup_start_time /tmp/backup_source_pod
+
+        # ── STEP 7: Summary ───────────────────────────────────────────────────
+
+        if [ "$FINAL_SIZE" = "3" ] && [ "$FINAL_LOCAL" = "Synced" ]; then
             log "=========================================="
             log "POST-BACKUP HOOK COMPLETED SUCCESSFULLY"
+            log "Backup source: $SOURCE_POD"
             log "Cluster fully restored and healthy"
             log "=========================================="
         else
             log "=========================================="
             log "POST-BACKUP HOOK COMPLETED WITH WARNINGS"
-            log "Cluster may not be fully recovered"
-            log "Size: $FINAL_CLUSTER_SIZE (expected 3)"
-            log "State: $FINAL_LOCAL_STATE (expected Synced)"
+            log "Backup source: $SOURCE_POD"
+            log "Size: $FINAL_SIZE (expected 3)"
+            log "State: $FINAL_LOCAL (expected Synced)"
             log "Manual verification recommended"
             log "=========================================="
         fi
-        
+
     ignoreFailure: false
     maxRetryCount: 1
     timeoutSeconds: 300
