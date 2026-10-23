@@ -67,5 +67,8 @@ spec:
         podSelector:
           labels:
             - matchLabels:
-                app: galera
+                # cr: galera-<Galera CR name>. Do NOT use app: galera alone: RHOSO deployments
+                # with several Galera CRs (e.g. openstack and openstack-keystone) label every
+                # Galera pod app=galera, and the hook would run on all of them.
+                cr: galera-openstack
         containerRegex: "galera"

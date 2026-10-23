@@ -45,7 +45,7 @@ ls -lh galera-safety-*.sql
 oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=0
 oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=0
 oc scale statefulset openstack-galera -n openstack --replicas=0
-oc get pods -n openstack -l app=galera   # wait until none
+oc get pods -n openstack -l cr=galera-openstack   # wait until none
 
 VSC=$(oc get volumesnapshotclass -o jsonpath='{.items[0].metadata.name}')
 for i in 0 1 2; do
@@ -66,7 +66,7 @@ oc get volumesnapshot -n openstack -w   # wait for READYTOUSE=true on all 3
 oc scale statefulset openstack-galera -n openstack --replicas=3
 oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=1
 oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=1
-oc get pods -n openstack -l app=galera -w   # all 3 Running and Ready
+oc get pods -n openstack -l cr=galera-openstack -w   # all 3 Running and Ready
 ```
 
 ## 1. Backup with writes in flight
@@ -103,7 +103,7 @@ oc get backup -n openstack -w
 Hook logs, only one pod does the work:
 
 ```bash
-oc logs -n openstack -l app=galera -c galera --tail=200 | grep trilio-backup
+oc logs -n openstack -l cr=galera-openstack -c galera --tail=200 | grep trilio-backup
 ```
 
 Record which pod was quiesced (`Selected as backup pod`) and which was active.
@@ -222,7 +222,7 @@ oc delete pod -n openstack galera-inspect-0 galera-inspect-1 galera-inspect-2
 oc scale statefulset openstack-galera -n openstack --replicas=3
 oc scale deployment mariadb-operator-controller-manager -n openstack-operators --replicas=1
 oc scale deployment openstack-operator-controller-manager -n openstack-operators --replicas=1
-oc get pods -n openstack -l app=galera -w
+oc get pods -n openstack -l cr=galera-openstack -w
 ```
 
 The operator honours `safe_to_bootstrap` before looking at seqnos, so it must
