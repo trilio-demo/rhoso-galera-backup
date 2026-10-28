@@ -18,6 +18,22 @@ which is the case for crash-consistent copies). The active pod kept committing
 while the quiesced pod was frozen, so **the operator will normally bootstrap from a
 crash-consistent copy**, and the consistent copy becomes a joiner.
 
+**Lab results so far (staging, keystone, 2026-10-27/28):** three restores, all
+came up healthy (size 3, Synced), including one from an incremental backup. With
+writes during the backup the operator bootstrapped from a crash-consistent copy
+every time (seqnos 2288/2288/2284 and 2442/2442/2437, consistent copy lowest), so
+Plan A works and the consistent copy was only insurance.
+
+**Hook v3 now sets `safe_to_bootstrap: 1` in the quiesced copy's grastate.dat**
+(pre-hook step 6b) while the provider is paused, so the snapshot carries the flag.
+The operator takes the first pod with that flag before comparing seqnos, so a
+restore of all 3 PVCs should bootstrap from the application-consistent copy and
+the other two SST from it. The restored data stops at the lock (a few writesets
+behind the active pod). This is what the next lab run has to confirm: expect the
+hook log line `safe_to_bootstrap set to 1` on the quiesced pod and, after
+restore, `this POD will now bootstrap a new galera cluster` on that same pod.
+To disable it, change the `MARK_SAFE_TO_BOOTSTRAP` default to `false` in the pre-hook script (T4K exec hooks cannot pass environment variables).
+
 Two outcomes are possible, and the lab has to tell us which one we get:
 
 - **Plan A works:** InnoDB crash recovery on the crash-consistent copy succeeds,
@@ -141,26 +157,26 @@ retry Plan A first.
 
 ## 3. Identify the consistent copy (forensics)
 
-Three independent ways. Use at least two and make sure they agree.
+Three independent ways. Use at least two and make sure they agree. grastate.dat (c) is the primary one, the hook log (a) the second.
 
 **a) The hook log from step 1.** `Selected as backup pod (ordinal N, ...)`.
 
-**b) The Service selector in the backup.** The backup contains Service
-`openstack`; its selector says which pod was active at backup time. The hook rule
-is "highest ordinal that is not the active": active 0 or 1 → consistent copy is
-`galera-2`; active 2 → `galera-1`. Read it from the restored Service before the
-operator rewrites it (right after the Restore is Completed, before scaling up):
+**b) The active pod at backup time.** The hook rule is "highest ordinal that is
+not the active": active 0 or 1 → consistent copy is `galera-2`; active 2 →
+`galera-1`. The active pod is the `statefulset.kubernetes.io/pod-name` selector of
+the ClusterIP Service `openstack` at the time of the backup. It is not in the
+backup (the Service is deliberately not backed up), so note it down when you run
+the backup, or read it from the hook log, which prints it.
 
-```bash
-oc get svc openstack -n openstack -o jsonpath='{.spec.selector.statefulset\.kubernetes\.io/pod-name}'
-```
-
-If the Restore did not replace the existing Service (`skipIfAlreadyExists`), check
-the Service YAML in the backup from the T4K UI (target browser) instead.
-
-**c) The seqno on disk.** With the StatefulSet at 0, mount each restored PVC and
-recover its position. The consistent copy has the LOWEST seqno (it was frozen
-first) and its `grastate.dat`, if present, has a real seqno instead of -1.
+**c) grastate.dat on disk (the cheapest and most reliable).** With the
+StatefulSet at 0, mount each restored PVC and `cat /var/lib/mysql/grastate.dat`.
+Galera writes grastate.dat with the current position when FTWRL pauses the node,
+so the consistent copy has a real `seqno` (for example `2153`); the two
+crash-consistent copies have `seqno: -1`, because a running node only writes it
+on clean shutdown. Confirmed in the lab on 2026-10-27. If you also need the
+position of the crash-consistent copies, run `--wsrep-recover` on them as
+below; the consistent copy's seqno is the lowest of the three when there were
+writes during the backup, and equal to the others when there were none.
 
 ```bash
 for i in 0 1 2; do

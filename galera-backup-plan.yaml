@@ -43,7 +43,10 @@ spec:
             version: v1
           objects:
             - openstack-galera   # headless, DNS for the pods
-            - openstack          # ClusterIP; its selector records which pod was active at backup time
+            # The ClusterIP Service "openstack" is deliberately NOT backed up: the operator
+            # recreates it, T4K restores Services with their finalizers (the operator's
+            # finalizer would block deletion if the Galera CR never reconciles), and its
+            # pod-name selector is re-elected on bootstrap anyway.
 
         - groupVersionKind:
             group: ""

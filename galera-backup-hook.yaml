@@ -241,6 +241,34 @@ spec:
 
         log "✓ Failover check passed. Active pod is still $ACTIVE_NOW."
 
+        # ── STEP 6b: Mark this copy as the bootstrap source ──────────────────
+        # While the provider is paused by FTWRL, Galera has written the real
+        # position into grastate.dat (seqno != -1). The mariadb-operator picks,
+        # before comparing seqnos, the first pod whose grastate.dat says
+        # safe_to_bootstrap: 1 (galera_controller.go, reconcile loop; it is the
+        # same flag the operator sets itself via detect_gcomm_and_start.sh).
+        # Setting it here, before the snapshot, makes a restore of all 3 PVCs
+        # bootstrap from THIS application-consistent copy; the two
+        # crash-consistent copies then SST from it. Without the flag the
+        # operator bootstraps from the copy with the highest seqno, which is a
+        # crash-consistent one whenever writes happened during the backup.
+        # Safe on the live node: Galera writes seqno -1 back on resume and the
+        # operator ignores the flag when seqno is -1 (detect_last_commit.sh);
+        # the post-hook also resets it to 0. Trade-off: the restored data stops
+        # at the lock, i.e. the few writesets committed during the backup window
+        # on the active pod are not part of the restore.
+        GRASTATE=/var/lib/mysql/grastate.dat
+        MARK_SAFE_TO_BOOTSTRAP="${MARK_SAFE_TO_BOOTSTRAP:-true}"
+        if [ "$MARK_SAFE_TO_BOOTSTRAP" = "true" ]; then
+            GSEQNO=$(sed -n 's/^seqno:[[:space:]]*//p' "$GRASTATE" 2>/dev/null)
+            if [ -n "$GSEQNO" ] && [ "$GSEQNO" != "-1" ]; then
+                sed -i 's/^safe_to_bootstrap:.*/safe_to_bootstrap: 1/' "$GRASTATE"
+                log "✓ grastate.dat: seqno $GSEQNO, safe_to_bootstrap set to 1 (this copy will bootstrap on restore)"
+            else
+                log_err "grastate.dat has no real seqno (got '${GSEQNO:--}'); not marking safe_to_bootstrap. Restore will bootstrap by seqno."
+            fi
+        fi
+
         # ── STEP 7: Record state for post-hook ───────────────────────────────
 
         touch /tmp/backup_in_progress
@@ -331,6 +359,17 @@ spec:
         mysql -u root -e "SET GLOBAL wsrep_desync = OFF;" 2>/dev/null \
             && log "✓ wsrep_desync = OFF" \
             || log_err "Failed to reset wsrep_desync. Manual intervention may be needed."
+
+        # ── STEP 3b: Clear the bootstrap mark on the live node ───────────────
+        # The pre-hook set safe_to_bootstrap: 1 so the SNAPSHOT carries it. The
+        # live node must not keep it (belt and braces: the operator already
+        # ignores it while seqno is -1).
+        GRASTATE=/var/lib/mysql/grastate.dat
+        if grep -q '^safe_to_bootstrap: 1' "$GRASTATE" 2>/dev/null; then
+            sed -i 's/^safe_to_bootstrap:.*/safe_to_bootstrap: 0/' "$GRASTATE" \
+                && log "✓ grastate.dat: safe_to_bootstrap reset to 0" \
+                || log_err "Could not reset safe_to_bootstrap in grastate.dat"
+        fi
 
         # ── STEP 4: Wait for node to resync ──────────────────────────────────
 
