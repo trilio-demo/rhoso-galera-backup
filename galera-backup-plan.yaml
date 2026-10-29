@@ -26,6 +26,8 @@ spec:
             version: v1
           objects:
             - mysql-db-openstack-galera-0
+            - mysql-db-openstack-galera-1
+            - mysql-db-openstack-galera-2
 
         - groupVersionKind:
             group: ""
@@ -40,7 +42,11 @@ spec:
             kind: Service
             version: v1
           objects:
-            - openstack-galera
+            - openstack-galera   # headless, DNS for the pods
+            # The ClusterIP Service "openstack" is deliberately NOT backed up: the operator
+            # recreates it, T4K restores Services with their finalizers (the operator's
+            # finalizer would block deletion if the Galera CR never reconciles), and its
+            # pod-name selector is re-elected on bootstrap anyway.
 
         - groupVersionKind:
             group: ""
@@ -56,16 +62,6 @@ spec:
           objects:
             - openstack-config-data
 
-      excludeResources:
-        gvkSelector:
-        - groupVersionKind:
-            group: ""
-            kind: PersistentVolumeClaim
-            version: v1
-          objects:
-            - mysql-db-openstack-galera-1
-            - mysql-db-openstack-galera-2
-
   hookConfig:
     mode: Sequential
     hooks:
@@ -74,5 +70,8 @@ spec:
         podSelector:
           labels:
             - matchLabels:
-                statefulset.kubernetes.io/pod-name: "openstack-galera-0"
+                # cr: galera-<Galera CR name>. Do NOT use app: galera alone: RHOSO deployments
+                # with several Galera CRs (e.g. openstack and openstack-keystone) label every
+                # Galera pod app=galera, and the hook would run on all of them.
+                cr: galera-openstack
         containerRegex: "galera"
