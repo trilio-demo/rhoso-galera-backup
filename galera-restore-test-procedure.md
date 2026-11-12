@@ -24,15 +24,12 @@ writes during the backup the operator bootstrapped from a crash-consistent copy
 every time (seqnos 2288/2288/2284 and 2442/2442/2437, consistent copy lowest), so
 Plan A works and the consistent copy was only insurance.
 
-**Hook v3 now sets `safe_to_bootstrap: 1` in the quiesced copy's grastate.dat**
-(pre-hook step 6b) while the provider is paused, so the snapshot carries the flag.
-The operator takes the first pod with that flag before comparing seqnos, so a
-restore of all 3 PVCs should bootstrap from the application-consistent copy and
-the other two SST from it. The restored data stops at the lock (a few writesets
-behind the active pod). This is what the next lab run has to confirm: expect the
-hook log line `safe_to_bootstrap set to 1` on the quiesced pod and, after
-restore, `this POD will now bootstrap a new galera cluster` on that same pod.
-To disable it, change the `MARK_SAFE_TO_BOOTSTRAP` default to `false` in the pre-hook script (T4K exec hooks cannot pass environment variables).
+**The hook does not write to Galera's own files.** An earlier revision set
+`safe_to_bootstrap: 1` in the quiesced copy's grastate.dat to steer the bootstrap.
+It was removed: the edit replaced a file Galera keeps open and left a stale
+grastate.dat on the live node, and steering the operator's bootstrap decision is
+not something a backup hook should do. The restore relies on the operator's own
+selection (highest seqno, recovered from InnoDB), which worked in every lab run.
 
 Two outcomes are possible, and the lab has to tell us which one we get:
 

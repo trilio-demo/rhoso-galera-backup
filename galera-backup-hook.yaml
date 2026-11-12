@@ -167,7 +167,6 @@ spec:
         # Every command inside tolerates failure: with set -e a failing kill or
         # wait would otherwise stop the script before desync is reset, leaving
         # the node Donor/Desynced and NotReady.
-        GRASTATE=/var/lib/mysql/grastate.dat
         release_all() {
             if [ -n "${LOCK_CONN_ID:-}" ]; then
                 mysql --connect-timeout=10 -u root -e "KILL ${LOCK_CONN_ID};" >/dev/null 2>&1 || true
@@ -177,7 +176,6 @@ spec:
                 wait "$LOCK_PID" >/dev/null 2>&1 || true
             fi
             mysql --connect-timeout=10 -u root -e "SET GLOBAL wsrep_desync = OFF;" >/dev/null 2>&1 || true
-            sed -i 's/^safe_to_bootstrap:.*/safe_to_bootstrap: 0/' "$GRASTATE" 2>/dev/null || true
             if [ -n "${WATCHDOG_PID:-}" ]; then
                 kill "$WATCHDOG_PID" >/dev/null 2>&1 || true
             fi
@@ -272,35 +270,9 @@ spec:
         fi
         log "✓ Failover check passed. Active pod is still ${ACTIVE_NOW:-unknown}."
 
-        # ── STEP 6b: Mark this copy as the bootstrap source ──────────────────
-        # While the provider is paused by FTWRL, Galera has written the real
-        # position into grastate.dat (seqno != -1). The mariadb-operator picks,
-        # before comparing seqnos, the first pod whose grastate.dat says
-        # safe_to_bootstrap: 1 (galera_controller.go reconcile loop; it is the
-        # same flag the operator sets itself via detect_gcomm_and_start.sh, and
-        # the flag Galera defines for exactly this purpose). Setting it here,
-        # before the snapshot, makes a restore of all PVCs bootstrap from THIS
-        # application-consistent copy; the crash-consistent copies then SST from
-        # it. Without the flag the operator bootstraps from the copy with the
-        # highest seqno, which is a crash-consistent one whenever writes
-        # happened during the backup.
-        # Safe on the live node: Galera writes seqno -1 back on resume and the
-        # operator ignores the flag when seqno is -1 (detect_last_commit.sh);
-        # the post-hook and every abort path also reset it to 0. If the lock
-        # expired before the snapshot, the snapshot carries seqno -1 and the
-        # flag is ignored, so it can never promote an inconsistent copy.
-        # Trade-off: the restored data stops at the lock, i.e. the writesets
-        # committed on the active pod during the backup window are not restored.
-        MARK_SAFE_TO_BOOTSTRAP="${MARK_SAFE_TO_BOOTSTRAP:-true}"
-        if [ "$MARK_SAFE_TO_BOOTSTRAP" = "true" ]; then
-            GSEQNO=$(sed -n 's/^seqno:[[:space:]]*//p' "$GRASTATE" 2>/dev/null) || true
-            if [ -n "$GSEQNO" ] && [ "$GSEQNO" != "-1" ]; then
-                sed -i 's/^safe_to_bootstrap:.*/safe_to_bootstrap: 1/' "$GRASTATE"
-                log "✓ grastate.dat: seqno $GSEQNO, safe_to_bootstrap set to 1 (this copy will bootstrap on restore)"
-            else
-                log_err "grastate.dat has no real seqno (got '${GSEQNO:--}'); not marking safe_to_bootstrap. Restore will bootstrap by seqno."
-            fi
-        fi
+        # NOTE: this hook never writes to Galera's own files (grastate.dat etc.).
+        # On restore the mariadb-operator picks the bootstrap node by itself
+        # (highest seqno, recovered from InnoDB), which is its normal path.
 
         # ── STEP 7: Record state for post-hook, start the watchdog ───────────
         touch /tmp/backup_in_progress
@@ -332,12 +304,10 @@ spec:
             [ -f /tmp/backup_in_progress ] || return 0
             mysql --connect-timeout=10 -u root -e "KILL $(cat /tmp/galera_lock_conn_id 2>/dev/null || echo 0);" >/dev/null 2>&1 || true
             mysql --connect-timeout=10 -u root -e "SET GLOBAL wsrep_desync = OFF;" >/dev/null 2>&1 || true
-            sed -i 's/^safe_to_bootstrap:.*/safe_to_bootstrap: 0/' "$GRASTATE" 2>/dev/null || true
             rm -f /tmp/backup_in_progress /tmp/galera_lock_pid /tmp/galera_lock_conn_id /tmp/galera_lock_marker /tmp/galera_watchdog_pid
             date +%s > /tmp/galera_watchdog_fired
             log_err "WATCHDOG: desync OFF, lock session killed, markers removed. Backup consistency NOT guaranteed."
         }
-        export GRASTATE
         export -f watchdog
         bash -c watchdog </dev/null >/dev/null 2>&1 &
         WATCHDOG_PID=$!
@@ -391,7 +361,6 @@ spec:
             exit 0
         fi
 
-        GRASTATE=/var/lib/mysql/grastate.dat
 
         # MySQL root credentials (same logic as the pre-hook). Checked BEFORE
         # stopping the watchdog: if we cannot talk to MySQL, the watchdog must
@@ -406,7 +375,6 @@ spec:
         if [ -z "${MYSQL_PWD:-}" ]; then
             log_err "No MySQL root credentials. Killing lock client anyway; desync must be reset manually."
             [ -f /tmp/galera_lock_pid ] && kill "$(cat /tmp/galera_lock_pid)" >/dev/null 2>&1 || true
-            sed -i 's/^safe_to_bootstrap:.*/safe_to_bootstrap: 0/' "$GRASTATE" 2>/dev/null || true
             exit 1
         fi
 
@@ -429,10 +397,7 @@ spec:
 
         # ── STEP 2: Was the lock still held? ─────────────────────────────────
         # The lock session is capped at SLEEP(900). If it is already gone, the
-        # snapshot may have been taken without the lock: say so loudly. (It
-        # cannot promote an inconsistent copy: once the lock dropped, Galera
-        # rewrote grastate.dat with seqno -1 and the operator ignores the
-        # safe_to_bootstrap flag in that case.)
+        # snapshot may have been taken without the lock: say so loudly.
         LOCK_CONN_ID=$(cat /tmp/galera_lock_conn_id 2>/dev/null || true)
         LOCK_MARKER=$(cat /tmp/galera_lock_marker 2>/dev/null || true)
         STILL_HELD=0
@@ -467,16 +432,6 @@ spec:
             && log "✓ wsrep_desync = OFF" \
             || log_err "Failed to reset wsrep_desync. Manual intervention may be needed."
         rm -f /tmp/backup_in_progress /tmp/backup_start_time /tmp/backup_source_pod
-
-        # ── STEP 4b: Clear the bootstrap mark on the live node ───────────────
-        # The pre-hook set safe_to_bootstrap: 1 so the SNAPSHOT carries it. The
-        # live node must not keep it (belt and braces: the operator already
-        # ignores it while seqno is -1).
-        if grep -q '^safe_to_bootstrap: 1' "$GRASTATE" 2>/dev/null; then
-            sed -i 's/^safe_to_bootstrap:.*/safe_to_bootstrap: 0/' "$GRASTATE" \
-                && log "✓ grastate.dat: safe_to_bootstrap reset to 0" \
-                || log_err "Could not reset safe_to_bootstrap in grastate.dat"
-        fi
 
         # ── STEP 5: Wait for node to resync ──────────────────────────────────
         log "Waiting for node to rejoin cluster..."
