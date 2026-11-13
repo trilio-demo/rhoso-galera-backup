@@ -59,21 +59,53 @@ pods() {
 }
 ```
 
-**Before every test, run `pods` in both terminals** and read the two names: it
-sets `$ACTIVE` and `$LOCKED`, which the commands below use, and they must be the
-same in both windows. They can change after Test 2 and Test 4. If it prints
-`STOP`, stop.
+## Before each test: three steps
 
-Then check the cluster is healthy: `st $LOCKED` must show
-`wsrep_local_state_comment Synced` and `wsrep_cluster_size 3`.
+Do these three things at the start of every test (0, 1, 2, 3 and 4).
 
-If `hooklog` ever shows `trilio-backup` lines but no `WSREP:` lines, tell me:
-the Galera log is going to a file instead of the pod log, and I will give you
-another command.
+**Step 1. Start the write load** in a third terminal and leave it running for
+the whole test. Use your script that creates and deletes projects and users,
+and start **5 copies of it at the same time**, not one. One copy is very little
+traffic compared to production.
 
-**Write load.** Keep it running during every test, in its own terminal. Use your
-create/delete project and user script and run **5 copies in parallel**, not one.
-Keystone with one loop is very light; the production cluster is not.
+**Step 2. Find out which pod is which.** In terminal 1 **and** in terminal 2, type:
+
+```bash
+pods
+```
+
+It prints two lines, for example:
+
+```
+ACTIVE (never lock this one) = openstack-keystone-galera-0
+LOCKED (the hook will lock)  = openstack-keystone-galera-2
+```
+
+- `ACTIVE` is the pod that is serving OpenStack right now. Nothing in this
+  guide should ever lock it.
+- `LOCKED` is the passive pod that the tests (and the hook) will lock.
+
+The command also saves those two names as `$ACTIVE` and `$LOCKED`, and every
+command in this guide uses them. That is why you run it in both terminals: both
+must print the same two names. The names can change from one test to the next
+(tests 2 and 4 move the active pod), so run it again every time.
+
+If it prints `STOP: cannot read the active pod`, do not continue. Send me that.
+
+**Step 3. Check the cluster is healthy.** In either terminal:
+
+```bash
+st $LOCKED
+```
+
+It prints four lines. Two of them must be exactly:
+
+```
+wsrep_local_state_comment   Synced
+wsrep_cluster_size          3
+```
+
+If it says anything else, do not start the test. Send me the output.
 
 ---
 
@@ -318,3 +350,10 @@ and of production:
 ```bash
 oc get csv -n openstack-operators | grep mariadb
 ```
+
+## If something looks odd
+
+- `command not found` for `st`, `sql`, `hooklog` or `pods`: paste the Setup block again in that terminal.
+- `hooklog` shows lines with `trilio-backup` but none with `WSREP:`: the Galera
+  log is going to a file and not to the pod log. Tell me and I will send another command.
+- Anything that does not match a "Must see" list: stop and send me the output.
