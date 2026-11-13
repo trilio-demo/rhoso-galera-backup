@@ -1,0 +1,194 @@
+apiVersion: triliovault.trilio.io/v1
+kind: Hook
+metadata:
+  name: galera-backup-hook
+  namespace: openstack
+spec:
+  # DESIGN (read this first)
+  # RHOSO runs Galera active/passive: the ClusterIP Service <cr> selects ONE pod
+  # (statefulset.kubernetes.io/pod-name) and all traffic goes there. This hook
+  # never touches that pod. On one passive pod it opens a single MySQL session
+  # that takes FLUSH TABLES WITH READ LOCK and sleeps. FTWRL itself desyncs and
+  # pauses the Galera provider, and resyncs it when the lock is released, so
+  # EVERYTHING is tied to that one session:
+  #   - post-hook kills the session        -> lock gone, node resyncs
+  #   - post-hook never comes              -> session expires after LOCK_MAX_SECONDS
+  #   - pod/container restarts             -> session dies with mysqld
+  # There is no global setting to restore and nothing else to clean up.
+  # A small watchdog kills the session within 5 s if a failover ever makes this
+  # pod the active one while it is locked.
+  # The hook never writes to Galera's own files.
+  pre:
+    execAction:
+      command:
+      - /bin/bash
+      - -c
+      - |
+        LOCK_MAX_SECONDS=300        # hard cap on how long the lock can live
+        ROLE=/tmp/galera_hook_role  # the only state file: "skipped" or "quiesced <marker>"
+        LOGFILE=/tmp/trilio-galera-hook.log
+        MY_HOSTNAME=$(hostname)
+        GALERA_CR="${HOSTNAME/-galera-[0-9]*/}"   # Service name == Galera CR name
+        SA=/var/run/secrets/kubernetes.io/serviceaccount
+        API=https://kubernetes.default.svc
+        NS=$(cat $SA/namespace)
+
+        log() { { echo "[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE" > /proc/1/fd/1; } 2>/dev/null || true; }
+        api() { curl -s --max-time 10 --cacert $SA/ca.crt -H "Authorization: Bearer $(cat $SA/token)" "$API/$1" 2>/dev/null; }
+        # Pod currently selected by the Service, or empty if it cannot be read.
+        get_active() { api "api/v1/namespaces/$NS/services/$GALERA_CR" | python3 -c 'import json,sys; print(json.load(sys.stdin)["spec"]["selector"].get("statefulset.kubernetes.io/pod-name",""))' 2>/dev/null; }
+        # One bounded MySQL query (20 s), tab-separated, no headers.
+        q() { timeout 20 mysql --connect-timeout=10 -u root -sN -e "$1" 2>/dev/null; }
+        # IDs of our lock session. The marker is passed in two halves so this
+        # query never matches itself (or another lookup) in PROCESSLIST.
+        lock_ids() { q "SELECT ID FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() AND COMMAND = 'Query' AND INFO LIKE CONCAT('%', '${MARKER%-*}', '-${MARKER##*-}', '%') AND INFO LIKE '%SLEEP(%';"; }
+        release() { for id in $(lock_ids); do q "KILL $id;"; done; [ -n "$LOCK_PID" ] && kill "$LOCK_PID" 2>/dev/null; }
+        fail() { log "ERROR: $1"; rm -f $ROLE; exit 1; }
+        skip() { log "$1"; echo skipped > $ROLE; exit 0; }
+
+        rm -f $ROLE
+        log "Hook started on $MY_HOSTNAME"
+
+        # ── Credentials: env var (RHOSO up to FR4) or operator script (FR5+) ──
+        if [ -n "${DB_ROOT_PASSWORD:-}" ]; then
+            MYSQL_PWD="$DB_ROOT_PASSWORD"
+        elif [ -f /var/lib/operator-scripts/mysql_root_auth.sh ]; then
+            MYSQL_PWD=$(timeout 30 bash -c 'source /var/lib/operator-scripts/mysql_root_auth.sh >/dev/null 2>&1; printf %s "$MYSQL_PWD"')
+        fi
+        [ -n "${MYSQL_PWD:-}" ] || fail "No MySQL root credentials."
+        export MYSQL_PWD
+
+        # ── 1. Who is active? Never touch it. ────────────────────────────────
+        ACTIVE=$(get_active)
+        [ -n "$ACTIVE" ] || fail "Cannot read the active pod from Service $GALERA_CR."
+        [ "$MY_HOSTNAME" != "$ACTIVE" ] || skip "This is the active pod ($ACTIVE). Skipping."
+
+        # ── 2. Which passive pod does the work? Highest ordinal that is not
+        #       active, computed from the DECLARED replicas so every pod gets
+        #       the same answer and a missing pod cannot go unnoticed. ────────
+        REPLICAS=$(api "apis/mariadb.openstack.org/v1beta1/namespaces/$NS/galeras/$GALERA_CR" | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["spec"]["replicas"]))' 2>/dev/null)
+        [ -n "$REPLICAS" ] || REPLICAS=$(api "api/v1/namespaces/$NS/pods?labelSelector=cr%3Dgalera-$GALERA_CR" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["items"]))' 2>/dev/null)
+        case "$REPLICAS" in ''|0|*[!0-9]*) fail "Cannot determine the number of replicas.";; esac
+        [ "$REPLICAS" -gt 1 ] || skip "Single-node Galera: nothing to quiesce, backup is crash-consistent."
+        PREFERRED=""
+        for ((i = REPLICAS - 1; i >= 0; i--)); do
+            [ "$GALERA_CR-galera-$i" != "$ACTIVE" ] && { PREFERRED="$GALERA_CR-galera-$i"; break; }
+        done
+
+        # ── 3. Health: full cluster, this node Synced. Checked on EVERY passive
+        #       pod, so a degraded cluster fails the backup even if the pod
+        #       that should take the lock is the one that is missing. ─────────
+        SIZE=$(q "SHOW STATUS LIKE 'wsrep_cluster_size';" | awk '{print $2}')
+        STATE=$(q "SHOW STATUS LIKE 'wsrep_local_state_comment';" | awk '{print $2}')
+        [ "$SIZE" = "$REPLICAS" ] || fail "Cluster is degraded (${SIZE:-no answer}/$REPLICAS nodes). Not quiescing."
+        [ "$STATE" = "Synced" ] || fail "Node is not Synced (${STATE:-no answer}). Not quiescing."
+
+        [ "$MY_HOSTNAME" = "$PREFERRED" ] || skip "Not the backup pod (backup pod: $PREFERRED, active: $ACTIVE). Skipping."
+        log "Selected as backup pod (active is $ACTIVE, $REPLICAS replicas, cluster healthy)"
+
+        # ── 4. Take the lock in ONE background session ───────────────────────
+        # stdin/stdout/stderr are detached: T4K runs this through the exec API,
+        # which does not return while any process still holds its stdout.
+        MARKER="trilio-galera-hook-$(date +%s)-$$"
+        mysql --connect-timeout=10 -u root \
+            -e "SET SESSION lock_wait_timeout = 60; FLUSH TABLES WITH READ LOCK; SELECT '$MARKER', SLEEP($LOCK_MAX_SECONDS);" \
+            </dev/null >/dev/null 2>&1 &
+        LOCK_PID=$!
+        log "Lock session started, waiting for FTWRL..."
+
+        # Held = the session has reached the SLEEP (FTWRL was granted) AND the
+        # node reports Donor/Desynced (FTWRL paused the provider).
+        HELD=""
+        for ((t = 0; t < 35 && SECONDS < 150; t++)); do
+            sleep 2
+            kill -0 "$LOCK_PID" 2>/dev/null || break
+            LOCK_ID=$(lock_ids | head -1)
+            WSTATE=$(q "SHOW STATUS LIKE 'wsrep_local_state_comment';" | awk '{print $2}')
+            [ -n "$LOCK_ID" ] && [ "$WSTATE" = "Donor/Desynced" ] && { HELD=yes; break; }
+        done
+        [ -n "$HELD" ] || { release; fail "Lock not confirmed (lock session: ${LOCK_ID:-none}, node state: ${WSTATE:-no answer}, expected Donor/Desynced). Released, aborting."; }
+
+        # ── 5. Failover guard: did we become active while taking the lock? ───
+        NOW=$(get_active)
+        [ -n "$NOW" ] && [ "$NOW" != "$MY_HOSTNAME" ] || { release; fail "Active pod is now '${NOW:-unknown}'. Released, aborting."; }
+
+        # ── 6. Watchdog: lives exactly as long as the lock session. Kills it
+        #       if the Service points at this pod, or if the active pod cannot
+        #       be read for 30 s. Nothing else to clean. ───────────────────────
+        watchdog() {
+            local unknown=0 a ids rc
+            while sleep 5 && [ $SECONDS -lt 420 ]; do
+                ids=$(lock_ids); rc=$?
+                [ $rc -eq 0 ] && [ -z "$ids" ] && return 0  # MySQL answered and the session is gone: done
+                a=$(get_active)
+                if [ "$a" = "$MY_HOSTNAME" ]; then
+                    log "ERROR: WATCHDOG: Service points at this pod while locked. Killing the lock session."; release; return 0
+                fi
+                [ -z "$a" ] && unknown=$((unknown + 1)) || unknown=0
+                if [ "$unknown" -ge 6 ]; then
+                    log "ERROR: WATCHDOG: active pod unknown for 30 s. Killing the lock session."; release; return 0
+                fi
+            done
+        }
+        export -f watchdog log api get_active q lock_ids release
+        export MARKER MY_HOSTNAME GALERA_CR SA API NS LOGFILE
+        LOCK_PID="" bash -c watchdog </dev/null >/dev/null 2>&1 &
+
+        echo "quiesced $MARKER" > $ROLE
+        log "PRE-BACKUP HOOK OK: $MY_HOSTNAME locked (session $LOCK_ID, max ${LOCK_MAX_SECONDS}s), active $ACTIVE untouched"
+        exit 0
+
+    ignoreFailure: false
+    maxRetryCount: 0
+    timeoutSeconds: 180
+
+  post:
+    execAction:
+      command:
+      - /bin/bash
+      - -c
+      - |
+        ROLE=/tmp/galera_hook_role
+        LOGFILE=/tmp/trilio-galera-hook.log
+        log() { { echo "[trilio-backup] [$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE" > /proc/1/fd/1; } 2>/dev/null || true; }
+        q() { timeout 20 mysql --connect-timeout=10 -u root -sN -e "$1" 2>/dev/null; }
+        lock_ids() { q "SELECT ID FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() AND COMMAND = 'Query' AND INFO LIKE CONCAT('%', '${MARKER%-*}', '-${MARKER##*-}', '%') AND INFO LIKE '%SLEEP(%';"; }
+
+        # Fail closed: if we do not know what the pre-hook did on this pod
+        # (it failed, or the container restarted since), the backup is not good.
+        [ -f $ROLE ] || { log "ERROR: no pre-hook result on this pod (pre-hook failed or container restarted). Failing the backup."; exit 1; }
+        read -r WHAT MARKER < $ROLE
+        rm -f $ROLE
+        [ "$WHAT" = "quiesced" ] || { log "This pod was not quiesced. Nothing to do."; exit 0; }
+        [ -n "$MARKER" ] || { log "ERROR: pre-hook result has no lock marker. Failing the backup."; exit 1; }
+
+        if [ -n "${DB_ROOT_PASSWORD:-}" ]; then
+            MYSQL_PWD="$DB_ROOT_PASSWORD"
+        elif [ -f /var/lib/operator-scripts/mysql_root_auth.sh ]; then
+            MYSQL_PWD=$(timeout 30 bash -c 'source /var/lib/operator-scripts/mysql_root_auth.sh >/dev/null 2>&1; printf %s "$MYSQL_PWD"')
+        fi
+        export MYSQL_PWD
+
+        # Was the lock still held when the snapshot finished? Then release it.
+        IDS=$(lock_ids); RC=$?
+        for id in $IDS; do q "KILL $id;"; done
+        if [ $RC -ne 0 ]; then
+            log "ERROR: MySQL did not answer; cannot tell if the lock was held. It expires by itself. Failing the backup."; exit 1
+        fi
+        if [ -z "$IDS" ]; then
+            log "ERROR: the lock session was NOT alive at post-hook time (expired, or killed by the watchdog). Backup is not application-consistent. Failing the backup."; exit 1
+        fi
+        log "Lock was held for the whole snapshot. Session $IDS killed, lock released."
+
+        # Informational: the node resyncs by itself once the lock is gone.
+        for ((t = 0; t < 36 && SECONDS < 240; t++)); do
+            STATE=$(q "SHOW STATUS LIKE 'wsrep_local_state_comment';" | awk '{print $2}')
+            [ "$STATE" = "Synced" ] && break
+            sleep 5
+        done
+        log "POST-BACKUP HOOK OK: node state ${STATE:-unknown}, cluster size $(q "SHOW STATUS LIKE 'wsrep_cluster_size';" | awk '{print $2}')"
+        exit 0
+
+    ignoreFailure: false
+    maxRetryCount: 0
+    timeoutSeconds: 300
