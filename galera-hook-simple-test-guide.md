@@ -15,9 +15,18 @@ without the hook. If Test 0 fails, the hook is not valid and nothing else matter
 
 ## Setup
 
-On macOS type `bash` first: every command here assumes bash, not zsh.
+The tests need **two terminal windows** open at the same time, both logged in
+to the staging cluster with `oc`. The guide calls them terminal 1 and terminal 2:
+in one you take the lock or trigger the backup, in the other you watch what
+happens. A third one runs the write load.
 
-Paste this block once per terminal:
+On macOS type `bash` first in each window: every command here assumes bash, not zsh.
+
+The block below defines a few variables and helper commands (`sql`, `st`,
+`hooklog`, `pods`). They only exist in the window where you paste them, so
+**paste the whole block in terminal 1 and again in terminal 2** before you
+start. If you open a new window later, paste it there too. If you ever get
+`command not found` for `st`, `sql`, `hooklog` or `pods`, this is why.
 
 ```bash
 NS=openstack
@@ -50,8 +59,10 @@ pods() {
 }
 ```
 
-**Before every test, run `pods`** and read the two names. They can change after
-Test 2 and Test 4. If it prints `STOP`, stop.
+**Before every test, run `pods` in both terminals** and read the two names: it
+sets `$ACTIVE` and `$LOCKED`, which the commands below use, and they must be the
+same in both windows. They can change after Test 2 and Test 4. If it prints
+`STOP`, stop.
 
 Then check the cluster is healthy: `st $LOCKED` must show
 `wsrep_local_state_comment Synced` and `wsrep_cluster_size 3`.
